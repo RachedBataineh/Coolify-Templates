@@ -15,7 +15,7 @@ services:
         - CMD
         - curl
         - '-f'
-        - 'http://127.0.0.1'
+        - 'http://127.0.0.1/wp-login.php'
       interval: 2s
       timeout: 10s
       retries: 10
