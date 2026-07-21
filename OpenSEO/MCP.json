@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "OpenSEO": {
+      "type": "http",
+      "url": "https://openseo.domain/mcp",
+      "oauth": {
+        "authorizationServerIssuer": "https://example.cloudflareaccess.com/"
+      }
+    }
+  }
+}

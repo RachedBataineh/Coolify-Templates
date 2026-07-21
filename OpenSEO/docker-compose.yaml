@@ -1,0 +1,108 @@
+# OpenSEO - Coolify compose, Postgres backend + hosted auth mode
+#
+# Differences vs. the D1 compose:
+#   1. DATABASE_PROVIDER=postgres moves app data to Postgres.
+#   2. CMD override applies Postgres migrations on every container start.
+#   3. .wrangler volume still required (KV, R2, Durable Objects live there).
+#   4. Image is pinned to v0.1.0 (immutable). To upgrade:
+#      a. Check https://github.com/every-app/open-seo/releases for the new version.
+#      b. Confirm the tag exists on GHCR (it should match the GitHub release).
+#      c. Skim Dockerfile.selfhost to confirm the CMD structure still matches the
+#         override below (db:migrate:local && vite build && vite preview shape).
+#      d. Update the tag here, save, deploy.
+#
+# Required secrets to set in Coolify UI (Normal view -> add as secret):
+#   - DATAFORSEO_API_KEY
+#   - GOOGLE_CLIENT_ID
+#   - GOOGLE_CLIENT_SECRET
+#   - TURNSTILE_SITE_KEY
+#   - TURNSTILE_SECRET_KEY
+#   - POSTGRES_DATABASE_URL  (e.g. postgres://user:pass@10.x.x.x:5432/openseo)
+#
+# The POSTGRES_DATABASE_URL secret is reused as the workerd Hyperdrive binding's
+# localConnectionString - no need to set it twice.
+services:
+  open-seo:
+    image: ghcr.io/every-app/open-seo:v0.1.0
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - |
+        pnpm run db:migrate:local && \
+        pnpm run db:migrate:pg && \
+        NODE_OPTIONS=--max-old-space-size=4096 pnpm run build && \
+        pnpm exec vite preview --host 0.0.0.0 --port $${PORT:-3001}
+    environment:
+      # --- Domain (declared on the LEFT so Coolify shows it in the Domains UI) ---
+      - SERVICE_FQDN_OPENSEO_3001=${SERVICE_FQDN_OPENSEO_3001}
+      - ALLOWED_HOST=${SERVICE_FQDN_OPENSEO}
+
+      # --- Required by OpenSEO for Docker self-hosting ---
+      - CLOUDFLARE_INCLUDE_PROCESS_ENV=true
+      - PORT=${PORT:-3001}
+
+      # --- Postgres backend (replaces D1/SQLite for main app data) ---
+      # Switches the provider-aware db handle to Postgres.
+      - DATABASE_PROVIDER=postgres
+      # workerd reads this at runtime to override the HYPERDRIVE binding's
+      # localConnectionString from wrangler.jsonc.
+      - CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE=${POSTGRES_DATABASE_URL}
+      # drizzle-kit reads this when `pnpm db:migrate:pg` runs at container start.
+      - POSTGRES_DATABASE_URL=${POSTGRES_DATABASE_URL}
+
+      # --- Auth: hosted mode (Better Auth email/password + Google OAuth) ---
+      - AUTH_MODE=${AUTH_MODE:-cloudflare_access}
+      # Required in hosted mode. Must be https (or localhost). Used for cookies,
+      # callbacks, and /api/auth routes.
+      - BETTER_AUTH_URL=${SERVICE_URL_OPENSEO}
+      # >=32 chars; symmetric encryption key for sessions and GSC OAuth tokens.
+      - BETTER_AUTH_SECRET=${SERVICE_BASE64_32_OPENSEO}
+      # Required in hosted mode (also used for Search Console OAuth).
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+
+      # --- Telemetry (off by default) ---
+      - OPENSEO_TELEMETRY_DISABLED=${OPENSEO_TELEMETRY_DISABLED:-1}
+      - DO_NOT_TRACK=${DO_NOT_TRACK:-1}
+
+      # --- Required: DataForSEO API key (set as secret in Coolify UI) ---
+      - DATAFORSEO_API_KEY=${DATAFORSEO_API_KEY}
+
+      # --- UI ---
+      - VITE_SHOW_DEVTOOLS=false
+
+      # --- Cloudflare Access ---
+      - TEAM_DOMAIN=${TEAM_DOMAIN_CLOUDFLARE:-https://example.cloudflareaccess.com}
+      - POLICY_AUD=${POLICY_AUD_CLOUDFLARE}
+      
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/favicon.ico').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Bumped from 180s to 240s: Postgres migrations add ~30-60s on first boot.
+      start_period: 240s
+
+    # Log rotation - prevents Docker logs from filling the disk over time.
+    # Caps at 3 rotated files x 10MB each = 30MB max per container.
+    # The vite build alone logs thousands of lines on every container start,
+    # so without this you'd hit disk pressure in 3-6 months.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    volumes:
+      # STILL REQUIRED even in Postgres mode: KV namespaces, R2 bucket
+      # (DataForSEO cache), and Durable Object state (OnboardingChatAgent,
+      # SamChatAgent history) all persist here.
+      - open_seo_data:/app/.wrangler
+
+volumes:
+  open_seo_data:
