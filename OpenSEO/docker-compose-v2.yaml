@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: 'postgres:16'
+    restart: unless-stopped
+    environment:
+      - 'POSTGRES_DB=${POSTGRES_DB:-openseo}'
+      - 'POSTGRES_USER=${POSTGRES_USER:-openseo}'
+      - 'POSTGRES_PASSWORD=${SERVICE_PASSWORD_64_POSTGRES}'
+    volumes:
+      - 'postgres_data:/var/lib/postgresql/data'
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"'
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  open-seo:
+    image: 'ghcr.io/every-app/open-seo:v0.1.2'
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command:
+      - sh
+      - '-c'
+      - "sed -i '/\"hyperdrive\":/,/],/s|// ||' /app/wrangler.jsonc && \\\npnpm run db:migrate:local && \\\npnpm run db:migrate:pg && \\\nNODE_OPTIONS=--max-old-space-size=4096 pnpm run build && \\\npnpm exec vite preview --host 0.0.0.0 --port $${PORT:-3001}\n"
+    environment:
+      - 'SERVICE_FQDN_OPENSEO_3001=${SERVICE_FQDN_OPENSEO_3001}'
+      - 'ALLOWED_HOST=${SERVICE_FQDN_OPENSEO}'
+      - CLOUDFLARE_INCLUDE_PROCESS_ENV=true
+      - 'PORT=${PORT:-3001}'
+      - DATABASE_PROVIDER=postgres
+      - 'POSTGRES_DATABASE_URL=postgres://${POSTGRES_USER:-openseo}:${SERVICE_PASSWORD_64_POSTGRES}@postgres:5432/${POSTGRES_DB:-openseo}'
+      - 'CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE=postgres://${POSTGRES_USER:-openseo}:${SERVICE_PASSWORD_64_POSTGRES}@postgres:5432/${POSTGRES_DB:-openseo}'
+      - 'AUTH_MODE=${AUTH_MODE:-cloudflare_access}'
+      - 'BETTER_AUTH_SECRET=${SERVICE_BASE64_32_OPENSEO}'
+      - 'GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}'
+      - 'GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}'
+      - 'OPENSEO_TELEMETRY_DISABLED=${OPENSEO_TELEMETRY_DISABLED:-1}'
+      - 'DO_NOT_TRACK=${DO_NOT_TRACK:-1}'
+      - 'DATAFORSEO_API_KEY=${DATAFORSEO_API_KEY}'
+      - VITE_SHOW_DEVTOOLS=false
+      - 'TEAM_DOMAIN=${TEAM_DOMAIN_CLOUDFLARE:-https://example.cloudflareaccess.com}'
+      - 'POLICY_AUD=${POLICY_AUD_CLOUDFLARE}'
+      - 'OPENROUTER_API_KEY=${OPENROUTER_API_KEY}'
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - '-e'
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||3001)+'/favicon.ico').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 240s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+    volumes:
+      - 'open_seo_data:/app/.wrangler'
+volumes:
+  open_seo_data: null
+  postgres_data: null
