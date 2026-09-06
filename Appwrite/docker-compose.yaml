@@ -1,0 +1,2172 @@
+# ==============================================================================
+# Appwrite 2.0 for Coolify - single-file Docker Compose template
+# ==============================================================================
+# A Coolify-ready packaging of the official Appwrite 2.0.0 compose file
+# (github.com/appwrite/appwrite, tag 2.0.0):
+#   - Coolify's proxy replaces Appwrite's own Traefik (no ports exposed)
+#   - All credentials and routing use Coolify magic variables (auto-generated)
+#   - One combined worker + scheduler by default; a per-queue worker topology,
+#     MongoDB (DocumentsDB) and an embeddings server are included behind
+#     optional compose profiles
+#
+# REQUIREMENTS
+#   - A Coolify server (Docker Compose resource type)
+#   - ~2 GB RAM free for the stack; 4 GB recommended for headroom
+#   - A DNS record pointing your domain at the server
+#
+# SERVER PREP - run once on the host (not possible from a compose file):
+#   # Required by Redis (avoids startup warning and failed background saves):
+#   echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf && sysctl -p
+#   # Optional on small/shared servers - swap absorbs memory spikes instead
+#   # of triggering the OOM killer:
+#   fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile \
+#     && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /fstab
+#
+# DEPLOY IN 5 STEPS
+#   1. Coolify: New Resource -> Docker Compose -> paste this file -> Deploy.
+#      One shared domain and all secrets are generated automatically.
+#   2. In the Domains section, set the SAME hostname on all three routed
+#      services, keeping their paths:
+#        Appwrite          ->  https://your.hostname/v1           (API)
+#        Appwrite Console  ->  https://your.hostname              (dashboard)
+#        Appwrite Realtime ->  https://your.hostname/v1/realtime  (websockets)
+#   3. In the Environment tab, set (required with a custom domain):
+#        _APP_DOMAIN=your.hostname
+#      Optional, when you start using those features:
+#        _APP_DOMAIN_FUNCTIONS=functions.your.hostname
+#        _APP_DOMAIN_SITES=sites.your.hostname
+#   4. On the Appwrite AND Appwrite Realtime services: Advanced ->
+#      "Path prefixes" -> "Keep prefixes". (Coolify defaults to
+#      "Strip prefixes", which removes /v1 before forwarding - the API
+#      then 404s every request.)
+#   5. Deploy again, then register the first user - it becomes the admin.
+#
+# VERIFY after step 5:
+#   https://your.hostname/v1/health/version must return {"version":"2.0.0"}
+#   as JSON. The Appwrite service healthcheck also asserts the origin
+#   allowlist: if it turns red after a deploy, _APP_DOMAIN is missing or
+#   wrong - set it and redeploy.
+#
+# COMPOSE PROFILES (set the COMPOSE_PROFILES env var in Coolify)
+#   combined   (default) one worker + one scheduler - recommended, cheapest
+#   separate   19 dedicated workers/schedulers for per-queue scaling
+#   mongodb    adds MongoDB for DocumentsDB (+ _APP_DOCUMENTSDB=enabled)
+#   embedding  adds the local embeddings server (+ _APP_EMBEDDING=enabled)
+#   Combine freely, e.g. COMPOSE_PROFILES=separate,mongodb
+#   `separate` automatically disables the combined worker/scheduler, so
+#   queues and timers are never processed twice. Parked profile services
+#   carry `exclude_from_hc: true` so the stack status badge ignores them -
+#   remove that flag on any service you activate, so it gets monitored.
+#
+# SCALING
+#   - API, realtime and the combined worker are stateless/queue-competing
+#     and carry no container_name: replicate them freely (deploy.replicas
+#     or `docker compose up --scale appwrite=2`).
+#   - Raise _APP_WORKER_MAX_COROUTINES (default 78) for worker throughput.
+#   - Keep schedulers and timers at exactly ONE instance (timers must not
+#     fire twice) - switch to the `separate` profile instead of scaling.
+#   - Never scale the executor, orchestrator or the databases.
+#
+# UPGRADING & NOTES
+#   - Bump _APP_VERSION in the Coolify UI and redeploy to upgrade.
+#   - Fresh PostgreSQL installs only. For existing Appwrite installations,
+#     follow the official Appwrite upgrade docs - do not reuse old volumes
+#     with this file. (MariaDB installs: swap the `postgresql` service for
+#     `mariadb` and set _APP_DB_ADAPTER=mariadb.)
+#   - Set _APP_SMTP_* before inviting users (emails queue until then).
+#   - Executor and orchestrator mount /var/run/docker.sock: they spawn
+#     function and build containers on the host, as upstream intends.
+# ==============================================================================
+x-logging:
+  logging:
+    driver: json-file
+    options:
+      max-file: "5"
+      max-size: 10m
+services:
+  # --------------------------------------------------------------------------
+  # API (main appwrite container) - serves /v1 on the shared Coolify domain
+  # --------------------------------------------------------------------------
+  appwrite:
+    # no container_name on purpose: this service can be replicated
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    healthcheck:
+      # Asserts liveness AND the origin allowlist: a missing/wrong
+      # _APP_DOMAIN turns this service red within ~1 minute of deploy,
+      # instead of failing console login/registration later.
+      test:
+        - CMD-SHELL
+        - 'curl -fsS -o /dev/null -H "Host: $${_APP_DOMAIN:-localhost}" -H "Origin: https://$${_APP_DOMAIN:-localhost}" http://localhost/v1/health/version'
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 120s
+    networks:
+      - appwrite
+    volumes:
+      - appwrite-uploads:/storage/uploads:rw
+      - appwrite-imports:/storage/imports:rw
+      - appwrite-cache:/storage/cache:rw
+      - appwrite-config:/storage/config:rw
+      - appwrite-certificates:/storage/certificates:rw
+      - appwrite-functions:/storage/functions:rw
+      - appwrite-sites:/storage/sites:rw
+      - appwrite-builds:/storage/builds:rw
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+      - appwrite-geo
+    environment:
+      # The _80 suffix pins the Traefik backend port explicitly; without it
+      # Coolify's port auto-detection can pick a wrong port and every /v1
+      # request 502s at the proxy.
+      - SERVICE_URL_APPWRITE_80=/v1
+      # Worker topology switch (Coolify shows this as an editable env var):
+      # combined (default) | separate | combined,mongodb | separate,embedding ...
+      # Referencing it here with a default makes Coolify persist it, so the
+      # combined worker/scheduler profile is active on a fresh deploy.
+      - 'COMPOSE_PROFILES=${COMPOSE_PROFILES:-combined}'
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_POOL_SIZE_USAGE=${_APP_POOL_SIZE_USAGE:-2}'
+      - '_APP_EXECUTIONS_DUAL_WRITE=${_APP_EXECUTIONS_DUAL_WRITE:-enabled}'
+      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_POOL_SIZE_EXECUTIONS=${_APP_POOL_SIZE_EXECUTIONS:-2}'
+      - '_APP_MAINTENANCE_RETENTION_USAGE_TTL=${_APP_MAINTENANCE_RETENTION_USAGE_TTL:-180}'
+      - '_APP_STATS_USAGE_QUEUE_NAME=${_APP_STATS_USAGE_QUEUE_NAME:-v1-stats-usage}'
+      - '_APP_STATS_RESOURCES_QUEUE_NAME=${_APP_STATS_RESOURCES_QUEUE_NAME:-v1-stats-resources}'
+      - '_APP_STATS_RESOURCES_INTERVAL=${_APP_STATS_RESOURCES_INTERVAL:-3600}'
+      - '_APP_EDITION=${_APP_EDITION:-self-hosted}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - '_APP_LOCALE=${_APP_LOCALE:-en}'
+      - '_APP_COMPRESSION_ENABLED=${_APP_COMPRESSION_ENABLED:-enabled}'
+      - '_APP_COMPRESSION_MIN_SIZE_BYTES=${_APP_COMPRESSION_MIN_SIZE_BYTES:-1024}'
+      - '_APP_CONSOLE_WHITELIST_ROOT=${_APP_CONSOLE_WHITELIST_ROOT:-enabled}'
+      - '_APP_CONSOLE_WHITELIST_EMAILS=${_APP_CONSOLE_WHITELIST_EMAILS:-}'
+      - '_APP_CONSOLE_SESSION_ALERTS=${_APP_CONSOLE_SESSION_ALERTS:-enabled}'
+      - '_APP_CONSOLE_WHITELIST_IPS=${_APP_CONSOLE_WHITELIST_IPS:-}'
+      - '_APP_CONSOLE_HOSTNAMES=${_APP_CONSOLE_HOSTNAMES:-}'
+      - '_APP_CONSOLE_SCHEMA=${_APP_CONSOLE_SCHEMA:-}'
+      - '_APP_CONSOLE_GITHUB_APP_ID=${_APP_CONSOLE_GITHUB_APP_ID:-}'
+      - '_APP_CONSOLE_GITHUB_SECRET=${_APP_CONSOLE_GITHUB_SECRET:-}'
+      - '_APP_CONSOLE_GITLAB_APP_ID=${_APP_CONSOLE_GITLAB_APP_ID:-}'
+      - '_APP_CONSOLE_GITLAB_SECRET=${_APP_CONSOLE_GITLAB_SECRET:-}'
+      - '_APP_CONSOLE_GITLAB_ENDPOINT=${_APP_CONSOLE_GITLAB_ENDPOINT:-}'
+      - '_APP_CONSOLE_BITBUCKET_APP_ID=${_APP_CONSOLE_BITBUCKET_APP_ID:-}'
+      - '_APP_CONSOLE_BITBUCKET_SECRET=${_APP_CONSOLE_BITBUCKET_SECRET:-}'
+      - '_APP_CONSOLE_GOOGLE_APP_ID=${_APP_CONSOLE_GOOGLE_APP_ID:-}'
+      - '_APP_CONSOLE_GOOGLE_SECRET=${_APP_CONSOLE_GOOGLE_SECRET:-}'
+      - '_APP_SYSTEM_EMAIL_NAME=${_APP_SYSTEM_EMAIL_NAME:-Appwrite}'
+      - '_APP_SYSTEM_EMAIL_ADDRESS=${_APP_SYSTEM_EMAIL_ADDRESS:-noreply@appwrite.io}'
+      - '_APP_SYSTEM_TEAM_EMAIL=${_APP_SYSTEM_TEAM_EMAIL:-team@appwrite.io}'
+      - '_APP_EMAIL_SECURITY=${_APP_EMAIL_SECURITY:-security@appwrite.io}'
+      - '_APP_SYSTEM_RESPONSE_FORMAT=${_APP_SYSTEM_RESPONSE_FORMAT:-}'
+      - '_APP_OPTIONS_ABUSE=${_APP_OPTIONS_ABUSE:-enabled}'
+      - '_APP_OPTIONS_ABUSE_INCREASED_LIMIT_PROJECTS=${_APP_OPTIONS_ABUSE_INCREASED_LIMIT_PROJECTS:-}'
+      - '_APP_OPTIONS_ROUTER_PROTECTION=${_APP_OPTIONS_ROUTER_PROTECTION:-disabled}'
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_OPTIONS_ROUTER_FORCE_HTTPS=${_APP_OPTIONS_ROUTER_FORCE_HTTPS:-disabled}'
+      - '_APP_ROUTER_AUTO_CERTIFICATES=${_APP_ROUTER_AUTO_CERTIFICATES:-}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_NOTIFICATIONS_TRACKING_SECRET=${_APP_NOTIFICATIONS_TRACKING_SECRET:-$SERVICE_PASSWORD_64_NOTIFICATIONS}'
+      # Set _APP_DOMAIN explicitly when using a custom domain (see the
+      # deploy steps in the header); the default only suits Coolify's
+      # auto-generated domain.
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
+      - _APP_CONSOLE_URL_SCHEME=root
+      - '_APP_CONSOLE_TRUSTED_PROJECTS=${_APP_CONSOLE_TRUSTED_PROJECTS:-}'
+      - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
+      - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
+      - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
+      - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
+      - '_APP_DNS=${_APP_DNS:-}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_ROOT_PASS=${_APP_DB_ROOT_PASS:-$SERVICE_PASSWORD_64_MONGODBROOT}'
+      - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
+      - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
+      - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
+      - '_APP_DB_SCHEMA_VECTORSDB=${_APP_DB_SCHEMA_VECTORSDB:-}'
+      - '_APP_DB_USER_VECTORSDB=${_APP_DB_USER_VECTORSDB:-}'
+      - '_APP_DB_PASS_VECTORSDB=${_APP_DB_PASS_VECTORSDB:-}'
+      - '_APP_DB_ADAPTER_DOCUMENTSDB=${_APP_DB_ADAPTER_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_HOST_DOCUMENTSDB=${_APP_DB_HOST_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_PORT_DOCUMENTSDB=${_APP_DB_PORT_DOCUMENTSDB:-27017}'
+      - '_APP_DB_SCHEMA_DOCUMENTSDB=${_APP_DB_SCHEMA_DOCUMENTSDB:-}'
+      - '_APP_DB_USER_DOCUMENTSDB=${_APP_DB_USER_DOCUMENTSDB:-}'
+      - '_APP_DB_PASS_DOCUMENTSDB=${_APP_DB_PASS_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_DOCUMENTSDB=${_APP_CONNECTIONS_DATABASE_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_VECTORSDB=${_APP_CONNECTIONS_DATABASE_VECTORSDB:-}'
+      - '_APP_SMTP_HOST=${_APP_SMTP_HOST:-}'
+      - '_APP_SMTP_PORT=${_APP_SMTP_PORT:-}'
+      - '_APP_SMTP_SECURE=${_APP_SMTP_SECURE:-}'
+      - '_APP_SMTP_USERNAME=${_APP_SMTP_USERNAME:-}'
+      - '_APP_SMTP_PASSWORD=${_APP_SMTP_PASSWORD:-}'
+      - '_APP_STORAGE_LIMIT=${_APP_STORAGE_LIMIT:-30000000}'
+      - '_APP_STORAGE_PREVIEW_LIMIT=${_APP_STORAGE_PREVIEW_LIMIT:-20000000}'
+      - '_APP_STORAGE_ANTIVIRUS=${_APP_STORAGE_ANTIVIRUS:-disabled}'
+      - '_APP_STORAGE_ANTIVIRUS_HOST=${_APP_STORAGE_ANTIVIRUS_HOST:-appwrite-clamav}'
+      - '_APP_STORAGE_ANTIVIRUS_PORT=${_APP_STORAGE_ANTIVIRUS_PORT:-3310}'
+      - '_APP_STORAGE_DEVICE=${_APP_STORAGE_DEVICE:-Local}'
+      - '_APP_STORAGE_S3_ACCESS_KEY=${_APP_STORAGE_S3_ACCESS_KEY:-}'
+      - '_APP_STORAGE_S3_SECRET=${_APP_STORAGE_S3_SECRET:-}'
+      - '_APP_STORAGE_S3_REGION=${_APP_STORAGE_S3_REGION:-us-east-1}'
+      - '_APP_STORAGE_S3_BUCKET=${_APP_STORAGE_S3_BUCKET:-}'
+      - '_APP_STORAGE_S3_ENDPOINT=${_APP_STORAGE_S3_ENDPOINT:-}'
+      - '_APP_STORAGE_DO_SPACES_ACCESS_KEY=${_APP_STORAGE_DO_SPACES_ACCESS_KEY:-}'
+      - '_APP_STORAGE_DO_SPACES_SECRET=${_APP_STORAGE_DO_SPACES_SECRET:-}'
+      - '_APP_STORAGE_DO_SPACES_REGION=${_APP_STORAGE_DO_SPACES_REGION:-us-east-1}'
+      - '_APP_STORAGE_DO_SPACES_BUCKET=${_APP_STORAGE_DO_SPACES_BUCKET:-}'
+      - '_APP_STORAGE_BACKBLAZE_ACCESS_KEY=${_APP_STORAGE_BACKBLAZE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_BACKBLAZE_SECRET=${_APP_STORAGE_BACKBLAZE_SECRET:-}'
+      - '_APP_STORAGE_BACKBLAZE_REGION=${_APP_STORAGE_BACKBLAZE_REGION:-us-west-004}'
+      - '_APP_STORAGE_BACKBLAZE_BUCKET=${_APP_STORAGE_BACKBLAZE_BUCKET:-}'
+      - '_APP_STORAGE_LINODE_ACCESS_KEY=${_APP_STORAGE_LINODE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_LINODE_SECRET=${_APP_STORAGE_LINODE_SECRET:-}'
+      - '_APP_STORAGE_LINODE_REGION=${_APP_STORAGE_LINODE_REGION:-eu-central-1}'
+      - '_APP_STORAGE_LINODE_BUCKET=${_APP_STORAGE_LINODE_BUCKET:-}'
+      - '_APP_STORAGE_WASABI_ACCESS_KEY=${_APP_STORAGE_WASABI_ACCESS_KEY:-}'
+      - '_APP_STORAGE_WASABI_SECRET=${_APP_STORAGE_WASABI_SECRET:-}'
+      - '_APP_STORAGE_WASABI_REGION=${_APP_STORAGE_WASABI_REGION:-eu-central-1}'
+      - '_APP_STORAGE_WASABI_BUCKET=${_APP_STORAGE_WASABI_BUCKET:-}'
+      - '_APP_COMPUTE_SIZE_LIMIT=${_APP_COMPUTE_SIZE_LIMIT:-30000000}'
+      - '_APP_FUNCTIONS_TIMEOUT=${_APP_FUNCTIONS_TIMEOUT:-900}'
+      - '_APP_SITES_TIMEOUT=${_APP_SITES_TIMEOUT:-60}'
+      - '_APP_COMPUTE_BUILD_TIMEOUT=${_APP_COMPUTE_BUILD_TIMEOUT:-900}'
+      - '_APP_COMPUTE_CPUS=${_APP_COMPUTE_CPUS:-0}'
+      - '_APP_COMPUTE_MEMORY=${_APP_COMPUTE_MEMORY:-0}'
+      - '_APP_FUNCTIONS_RUNTIMES=${_APP_FUNCTIONS_RUNTIMES:-node-22}'
+      - '_APP_SITES_RUNTIMES=${_APP_SITES_RUNTIMES:-static-1,node-22}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_EXECUTOR_SECRET=${_APP_EXECUTOR_SECRET:-$SERVICE_PASSWORD_64_EXECUTOR}'
+      - '_APP_EXECUTOR_HOST=${_APP_EXECUTOR_HOST:-http://openruntimes-executor/v1}'
+      - '_APP_BUILDS_VOLUME=${_APP_BUILDS_VOLUME:-appwrite-builds}'
+      - '_APP_JOBS_HOST=${_APP_JOBS_HOST:-http://orchestrator:8080}'
+      - '_APP_JOBS_SECRET=${_APP_JOBS_SECRET:-$SERVICE_PASSWORD_64_JOBS}'
+      - '_APP_JOBS_ENDPOINT=${_APP_JOBS_ENDPOINT:-http://appwrite}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_LOCKING_ENABLED=${_APP_LOCKING_ENABLED:-}'
+      - '_APP_MAINTENANCE_INTERVAL=${_APP_MAINTENANCE_INTERVAL:-86400}'
+      - '_APP_MAINTENANCE_RETENTION_EXECUTION=${_APP_MAINTENANCE_RETENTION_EXECUTION:-1209600}'
+      - '_APP_MAINTENANCE_RETENTION_CACHE=${_APP_MAINTENANCE_RETENTION_CACHE:-2592000}'
+      - '_APP_MAINTENANCE_RETENTION_ABUSE=${_APP_MAINTENANCE_RETENTION_ABUSE:-86400}'
+      - '_APP_MAINTENANCE_RETENTION_AUDIT=${_APP_MAINTENANCE_RETENTION_AUDIT:-1209600}'
+      - '_APP_MAINTENANCE_RETENTION_AUDIT_CONSOLE=${_APP_MAINTENANCE_RETENTION_AUDIT_CONSOLE:-15778800}'
+      - '_APP_MAINTENANCE_RETENTION_USAGE_HOURLY=${_APP_MAINTENANCE_RETENTION_USAGE_HOURLY:-8640000}'
+      - '_APP_MAINTENANCE_RETENTION_SCHEDULES=${_APP_MAINTENANCE_RETENTION_SCHEDULES:-86400}'
+      - '_APP_SMS_PROVIDER=${_APP_SMS_PROVIDER:-}'
+      - '_APP_SMS_FROM=${_APP_SMS_FROM:-}'
+      - '_APP_GRAPHQL_INTROSPECTION=${_APP_GRAPHQL_INTROSPECTION:-enabled}'
+      - '_APP_GRAPHQL_MAX_BATCH_SIZE=${_APP_GRAPHQL_MAX_BATCH_SIZE:-10}'
+      - '_APP_GRAPHQL_MAX_COMPLEXITY=${_APP_GRAPHQL_MAX_COMPLEXITY:-250}'
+      - '_APP_GRAPHQL_MAX_DEPTH=${_APP_GRAPHQL_MAX_DEPTH:-4}'
+      - '_APP_VCS_GITHUB_APP_NAME=${_APP_VCS_GITHUB_APP_NAME:-}'
+      - '_APP_VCS_GITHUB_PRIVATE_KEY=${_APP_VCS_GITHUB_PRIVATE_KEY:-disabled}'
+      - '_APP_VCS_GITHUB_APP_ID=${_APP_VCS_GITHUB_APP_ID:-}'
+      - '_APP_VCS_GITHUB_WEBHOOK_SECRET=${_APP_VCS_GITHUB_WEBHOOK_SECRET:-}'
+      - '_APP_VCS_GITHUB_CLIENT_SECRET=${_APP_VCS_GITHUB_CLIENT_SECRET:-}'
+      - '_APP_VCS_GITHUB_CLIENT_ID=${_APP_VCS_GITHUB_CLIENT_ID:-}'
+      - '_APP_VCS_GITEA_ENDPOINT=${_APP_VCS_GITEA_ENDPOINT:-}'
+      - '_APP_VCS_GITEA_BROWSER_ENDPOINT=${_APP_VCS_GITEA_BROWSER_ENDPOINT:-}'
+      - '_APP_VCS_GITEA_CLIENT_ID=${_APP_VCS_GITEA_CLIENT_ID:-}'
+      - '_APP_VCS_GITEA_CLIENT_SECRET=${_APP_VCS_GITEA_CLIENT_SECRET:-}'
+      - '_APP_VCS_GITEA_WEBHOOK_SECRET=${_APP_VCS_GITEA_WEBHOOK_SECRET:-}'
+      - '_APP_VCS_GITLAB_ENDPOINT=${_APP_VCS_GITLAB_ENDPOINT:-}'
+      - '_APP_VCS_GITLAB_CLIENT_ID=${_APP_VCS_GITLAB_CLIENT_ID:-}'
+      - '_APP_VCS_GITLAB_CLIENT_SECRET=${_APP_VCS_GITLAB_CLIENT_SECRET:-}'
+      - '_APP_VCS_GITLAB_WEBHOOK_SECRET=${_APP_VCS_GITLAB_WEBHOOK_SECRET:-}'
+      - '_APP_VCS_BITBUCKET_CLIENT_ID=${_APP_VCS_BITBUCKET_CLIENT_ID:-}'
+      - '_APP_VCS_BITBUCKET_CLIENT_SECRET=${_APP_VCS_BITBUCKET_CLIENT_SECRET:-}'
+      - '_APP_VCS_BITBUCKET_WEBHOOK_SECRET=${_APP_VCS_BITBUCKET_WEBHOOK_SECRET:-}'
+      - '_APP_VCS_ORIGIN_CLIENT_ID=${_APP_VCS_ORIGIN_CLIENT_ID:-}'
+      - '_APP_VCS_ORIGIN_PRIVATE_KEY=${_APP_VCS_ORIGIN_PRIVATE_KEY:-}'
+      - '_APP_VCS_WEBHOOK_URL=${_APP_VCS_WEBHOOK_URL:-http://appwrite/v1}'
+      - '_APP_MIGRATIONS_FIREBASE_CLIENT_ID=${_APP_MIGRATIONS_FIREBASE_CLIENT_ID:-}'
+      - '_APP_MIGRATIONS_FIREBASE_CLIENT_SECRET=${_APP_MIGRATIONS_FIREBASE_CLIENT_SECRET:-}'
+      - '_APP_ASSISTANT_OPENAI_API_KEY=${_APP_ASSISTANT_OPENAI_API_KEY:-}'
+      - '_APP_CONSOLE_COUNTRIES_DENYLIST=${_APP_CONSOLE_COUNTRIES_DENYLIST:-}'
+      - '_APP_EXPERIMENT_LOGGING_PROVIDER=${_APP_EXPERIMENT_LOGGING_PROVIDER:-}'
+      - '_APP_EXPERIMENT_LOGGING_CONFIG=${_APP_EXPERIMENT_LOGGING_CONFIG:-}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - '_APP_DATABASE_SHARED_NAMESPACE=${_APP_DATABASE_SHARED_NAMESPACE:-}'
+      - '_APP_FUNCTIONS_CREATION_ABUSE_LIMIT=${_APP_FUNCTIONS_CREATION_ABUSE_LIMIT:-5000}'
+      - '_APP_CUSTOM_DOMAIN_DENY_LIST=${_APP_CUSTOM_DOMAIN_DENY_LIST:-}'
+      - '_APP_TRUSTED_HEADERS=${_APP_TRUSTED_HEADERS:-x-forwarded-for}'
+      - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
+      - '_APP_GEO_SECRET=${_APP_GEO_SECRET:-$SERVICE_PASSWORD_64_GEO}'
+      - '_APP_GEO_ENDPOINT=${_APP_GEO_ENDPOINT:-http://appwrite-geo/v1}'
+      - '_APP_LIMIT_DATABASE_BATCH=${_APP_LIMIT_DATABASE_BATCH:-}'
+      - '_APP_DOCUMENTSDB=${_APP_DOCUMENTSDB:-disabled}'
+      - '_APP_VECTORSDB=${_APP_VECTORSDB:-disabled}'
+      - '_APP_EMBEDDING=${_APP_EMBEDDING:-disabled}'
+
+  # --------------------------------------------------------------------------
+  # Console IV - served at `/` of the shared Coolify domain (port 3000)
+  # --------------------------------------------------------------------------
+  appwrite-console:
+    image: 'appwrite/new:1.1.16'
+    container_name: appwrite-console
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    environment:
+      - SERVICE_URL_APPWRITE_3000=/
+      - VITE_CONSOLE_PROFILE=self-hosted
+      - APPWRITE_ENDPOINT_SAME_ORIGIN=true
+      - VITE_GROWTH_ENDPOINT=https://growth.appwrite.io/v1
+
+  # --------------------------------------------------------------------------
+  # Realtime - websocket endpoint /v1/realtime
+  # --------------------------------------------------------------------------
+  appwrite-realtime:
+    # no container_name on purpose: this service can be replicated
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    entrypoint: realtime
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    # Raise the fd limit so Swoole accepts its max_connection setting instead
+    # of warning "max_connection ... reset to 1024" (capped by the nofile ulimit).
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    depends_on:
+      - '${_APP_DB_HOST:-postgresql}'
+      - redis
+    environment:
+      # Port-less on purpose: declaring the same port-suffixed variable on
+      # two services with different paths makes Coolify merge their routers.
+      # Without a port label Traefik uses the image's exposed port 80 - correct.
+      - SERVICE_URL_APPWRITE=/v1/realtime
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
+      - '_APP_STATS_USAGE_QUEUE_NAME=${_APP_STATS_USAGE_QUEUE_NAME:-v1-stats-usage}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_OPTIONS_ABUSE=${_APP_OPTIONS_ABUSE:-enabled}'
+      - '_APP_OPTIONS_ROUTER_PROTECTION=${_APP_OPTIONS_ROUTER_PROTECTION:-disabled}'
+      - '_APP_CONSOLE_HOSTNAMES=${_APP_CONSOLE_HOSTNAMES:-}'
+      - '_APP_REALTIME_TAIL_RATE=${_APP_REALTIME_TAIL_RATE:-50}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
+      - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
+      - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
+      - '_APP_DB_SCHEMA_VECTORSDB=${_APP_DB_SCHEMA_VECTORSDB:-}'
+      - '_APP_DB_USER_VECTORSDB=${_APP_DB_USER_VECTORSDB:-}'
+      - '_APP_DB_PASS_VECTORSDB=${_APP_DB_PASS_VECTORSDB:-}'
+      - '_APP_DB_ADAPTER_DOCUMENTSDB=${_APP_DB_ADAPTER_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_HOST_DOCUMENTSDB=${_APP_DB_HOST_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_PORT_DOCUMENTSDB=${_APP_DB_PORT_DOCUMENTSDB:-27017}'
+      - '_APP_DB_SCHEMA_DOCUMENTSDB=${_APP_DB_SCHEMA_DOCUMENTSDB:-}'
+      - '_APP_DB_USER_DOCUMENTSDB=${_APP_DB_USER_DOCUMENTSDB:-}'
+      - '_APP_DB_PASS_DOCUMENTSDB=${_APP_DB_PASS_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_DOCUMENTSDB=${_APP_CONNECTIONS_DATABASE_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_VECTORSDB=${_APP_CONNECTIONS_DATABASE_VECTORSDB:-}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_CONFIG_REALTIME=${_APP_LOGGING_CONFIG_REALTIME:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - '_APP_LIMIT_DATABASE_BATCH=${_APP_LIMIT_DATABASE_BATCH:-}'
+      - '_APP_DOCUMENTSDB=${_APP_DOCUMENTSDB:-disabled}'
+      - '_APP_VECTORSDB=${_APP_VECTORSDB:-disabled}'
+      - '_APP_EMBEDDING=${_APP_EMBEDDING:-disabled}'
+      - _APP_POOL_ADAPTER=swoole
+
+  # --------------------------------------------------------------------------
+  # COMBINED worker + scheduler (default topology, profile `combined`)
+  # One process consumes every queue; one process fires every timer.
+  # --------------------------------------------------------------------------
+  appwrite-worker:
+    # no container_name on purpose: queue consumers can be replicated
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    entrypoint: worker
+    profiles:
+      - combined
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    volumes:
+      - appwrite-uploads:/storage/uploads:rw
+      - appwrite-cache:/storage/cache:rw
+      - appwrite-functions:/storage/functions:rw
+      - appwrite-sites:/storage/sites:rw
+      - appwrite-builds:/storage/builds:rw
+      - appwrite-certificates:/storage/certificates:rw
+      - appwrite-config:/storage/config:rw
+      - appwrite-imports:/storage/imports:rw
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_POOL_SIZE_USAGE=${_APP_POOL_SIZE_USAGE:-2}'
+      - '_APP_EXECUTIONS_DUAL_WRITE=${_APP_EXECUTIONS_DUAL_WRITE:-enabled}'
+      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_POOL_SIZE_EXECUTIONS=${_APP_POOL_SIZE_EXECUTIONS:-2}'
+      - '_APP_MAINTENANCE_RETENTION_USAGE_TTL=${_APP_MAINTENANCE_RETENTION_USAGE_TTL:-180}'
+      - '_APP_STATS_USAGE_QUEUE_NAME=${_APP_STATS_USAGE_QUEUE_NAME:-v1-stats-usage}'
+      - '_APP_STATS_RESOURCES_QUEUE_NAME=${_APP_STATS_RESOURCES_QUEUE_NAME:-v1-stats-resources}'
+      - '_APP_STATS_RESOURCES_INTERVAL=${_APP_STATS_RESOURCES_INTERVAL:-3600}'
+      - _APP_WORKERS_NUM=1
+      # Pool sizing only (sum of per-queue caps). Each queue keeps its own maxCoroutines in PHP; databases stays at 1.
+      - _APP_WORKER_MAX_COROUTINES=78
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_EMAIL_SECURITY=${_APP_EMAIL_SECURITY:-security@appwrite.io}'
+      - '_APP_EMAIL_CERTIFICATES=${_APP_EMAIL_CERTIFICATES:-certificates@appwrite.io}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
+      - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
+      - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
+      - '_APP_DB_SCHEMA_VECTORSDB=${_APP_DB_SCHEMA_VECTORSDB:-}'
+      - '_APP_DB_USER_VECTORSDB=${_APP_DB_USER_VECTORSDB:-}'
+      - '_APP_DB_PASS_VECTORSDB=${_APP_DB_PASS_VECTORSDB:-}'
+      - '_APP_DB_ADAPTER_DOCUMENTSDB=${_APP_DB_ADAPTER_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_HOST_DOCUMENTSDB=${_APP_DB_HOST_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_PORT_DOCUMENTSDB=${_APP_DB_PORT_DOCUMENTSDB:-27017}'
+      - '_APP_DB_SCHEMA_DOCUMENTSDB=${_APP_DB_SCHEMA_DOCUMENTSDB:-}'
+      - '_APP_DB_USER_DOCUMENTSDB=${_APP_DB_USER_DOCUMENTSDB:-}'
+      - '_APP_DB_PASS_DOCUMENTSDB=${_APP_DB_PASS_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_DOCUMENTSDB=${_APP_CONNECTIONS_DATABASE_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_VECTORSDB=${_APP_CONNECTIONS_DATABASE_VECTORSDB:-}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_LOGGING_PROVIDER=${_APP_LOGGING_PROVIDER:-}'
+      - '_APP_QUEUE_NAME=${_APP_QUEUE_NAME:-}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - _APP_CONSOLE_URL_SCHEME=root
+      - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
+      - '_APP_CONSOLE_TRUSTED_PROJECTS=${_APP_CONSOLE_TRUSTED_PROJECTS:-}'
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
+      - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
+      - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
+      - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
+      - '_APP_DNS=${_APP_DNS:-}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_OPTIONS_ROUTER_FORCE_HTTPS=${_APP_OPTIONS_ROUTER_FORCE_HTTPS:-disabled}'
+      - '_APP_WEBHOOK_MAX_FAILED_ATTEMPTS=${_APP_WEBHOOK_MAX_FAILED_ATTEMPTS:-10}'
+      - '_APP_STORAGE_DEVICE=${_APP_STORAGE_DEVICE:-Local}'
+      - '_APP_STORAGE_S3_ACCESS_KEY=${_APP_STORAGE_S3_ACCESS_KEY:-}'
+      - '_APP_STORAGE_S3_SECRET=${_APP_STORAGE_S3_SECRET:-}'
+      - '_APP_STORAGE_S3_REGION=${_APP_STORAGE_S3_REGION:-us-east-1}'
+      - '_APP_STORAGE_S3_BUCKET=${_APP_STORAGE_S3_BUCKET:-}'
+      - '_APP_STORAGE_S3_ENDPOINT=${_APP_STORAGE_S3_ENDPOINT:-}'
+      - '_APP_STORAGE_DO_SPACES_ACCESS_KEY=${_APP_STORAGE_DO_SPACES_ACCESS_KEY:-}'
+      - '_APP_STORAGE_DO_SPACES_SECRET=${_APP_STORAGE_DO_SPACES_SECRET:-}'
+      - '_APP_STORAGE_DO_SPACES_REGION=${_APP_STORAGE_DO_SPACES_REGION:-us-east-1}'
+      - '_APP_STORAGE_DO_SPACES_BUCKET=${_APP_STORAGE_DO_SPACES_BUCKET:-}'
+      - '_APP_STORAGE_BACKBLAZE_ACCESS_KEY=${_APP_STORAGE_BACKBLAZE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_BACKBLAZE_SECRET=${_APP_STORAGE_BACKBLAZE_SECRET:-}'
+      - '_APP_STORAGE_BACKBLAZE_REGION=${_APP_STORAGE_BACKBLAZE_REGION:-us-west-004}'
+      - '_APP_STORAGE_BACKBLAZE_BUCKET=${_APP_STORAGE_BACKBLAZE_BUCKET:-}'
+      - '_APP_STORAGE_LINODE_ACCESS_KEY=${_APP_STORAGE_LINODE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_LINODE_SECRET=${_APP_STORAGE_LINODE_SECRET:-}'
+      - '_APP_STORAGE_LINODE_REGION=${_APP_STORAGE_LINODE_REGION:-eu-central-1}'
+      - '_APP_STORAGE_LINODE_BUCKET=${_APP_STORAGE_LINODE_BUCKET:-}'
+      - '_APP_STORAGE_WASABI_ACCESS_KEY=${_APP_STORAGE_WASABI_ACCESS_KEY:-}'
+      - '_APP_STORAGE_WASABI_SECRET=${_APP_STORAGE_WASABI_SECRET:-}'
+      - '_APP_STORAGE_WASABI_REGION=${_APP_STORAGE_WASABI_REGION:-eu-central-1}'
+      - '_APP_STORAGE_WASABI_BUCKET=${_APP_STORAGE_WASABI_BUCKET:-}'
+      - '_APP_EXECUTOR_SECRET=${_APP_EXECUTOR_SECRET:-$SERVICE_PASSWORD_64_EXECUTOR}'
+      - '_APP_EXECUTOR_HOST=${_APP_EXECUTOR_HOST:-http://openruntimes-executor/v1}'
+      - '_APP_DOCKER_HUB_USERNAME=${_APP_DOCKER_HUB_USERNAME:-}'
+      - '_APP_DOCKER_HUB_PASSWORD=${_APP_DOCKER_HUB_PASSWORD:-}'
+      - '_APP_FUNCTIONS_TIMEOUT=${_APP_FUNCTIONS_TIMEOUT:-900}'
+      - '_APP_SITES_TIMEOUT=${_APP_SITES_TIMEOUT:-60}'
+      - '_APP_COMPUTE_BUILD_TIMEOUT=${_APP_COMPUTE_BUILD_TIMEOUT:-900}'
+      - '_APP_COMPUTE_CPUS=${_APP_COMPUTE_CPUS:-0}'
+      - '_APP_COMPUTE_MEMORY=${_APP_COMPUTE_MEMORY:-0}'
+      - '_APP_OPEN_RUNTIMES_NFT=${_APP_OPEN_RUNTIMES_NFT:-enabled}'
+      - '_APP_COMPUTE_SIZE_LIMIT=${_APP_COMPUTE_SIZE_LIMIT:-30000000}'
+      - '_APP_VCS_GITHUB_APP_NAME=${_APP_VCS_GITHUB_APP_NAME:-}'
+      - '_APP_VCS_GITHUB_PRIVATE_KEY=${_APP_VCS_GITHUB_PRIVATE_KEY:-disabled}'
+      - '_APP_VCS_GITHUB_APP_ID=${_APP_VCS_GITHUB_APP_ID:-}'
+      - '_APP_VCS_GITEA_ENDPOINT=${_APP_VCS_GITEA_ENDPOINT:-}'
+      - '_APP_VCS_GITEA_BROWSER_ENDPOINT=${_APP_VCS_GITEA_BROWSER_ENDPOINT:-}'
+      - '_APP_VCS_GITEA_CLIENT_ID=${_APP_VCS_GITEA_CLIENT_ID:-}'
+      - '_APP_VCS_GITEA_CLIENT_SECRET=${_APP_VCS_GITEA_CLIENT_SECRET:-}'
+      - '_APP_VCS_GITEA_WEBHOOK_SECRET=${_APP_VCS_GITEA_WEBHOOK_SECRET:-}'
+      - '_APP_VCS_GITLAB_ENDPOINT=${_APP_VCS_GITLAB_ENDPOINT:-}'
+      - '_APP_VCS_GITLAB_CLIENT_ID=${_APP_VCS_GITLAB_CLIENT_ID:-}'
+      - '_APP_VCS_GITLAB_CLIENT_SECRET=${_APP_VCS_GITLAB_CLIENT_SECRET:-}'
+      - '_APP_VCS_GITLAB_WEBHOOK_SECRET=${_APP_VCS_GITLAB_WEBHOOK_SECRET:-}'
+      - '_APP_VCS_BITBUCKET_CLIENT_ID=${_APP_VCS_BITBUCKET_CLIENT_ID:-}'
+      - '_APP_VCS_BITBUCKET_CLIENT_SECRET=${_APP_VCS_BITBUCKET_CLIENT_SECRET:-}'
+      - '_APP_VCS_BITBUCKET_WEBHOOK_SECRET=${_APP_VCS_BITBUCKET_WEBHOOK_SECRET:-}'
+      - '_APP_VCS_ORIGIN_CLIENT_ID=${_APP_VCS_ORIGIN_CLIENT_ID:-}'
+      - '_APP_VCS_ORIGIN_PRIVATE_KEY=${_APP_VCS_ORIGIN_PRIVATE_KEY:-}'
+      - '_APP_VCS_WEBHOOK_URL=${_APP_VCS_WEBHOOK_URL:-http://appwrite/v1}'
+      - '_APP_BUILDS_VOLUME=${_APP_BUILDS_VOLUME:-appwrite-builds}'
+      - '_APP_JOBS_HOST=${_APP_JOBS_HOST:-http://orchestrator:8080}'
+      - '_APP_JOBS_SECRET=${_APP_JOBS_SECRET:-$SERVICE_PASSWORD_64_JOBS}'
+      - '_APP_JOBS_ENDPOINT=${_APP_JOBS_ENDPOINT:-http://appwrite}'
+      - '_APP_BROWSER_HOST=${_APP_BROWSER_HOST:-http://appwrite-browser:3000/v1}'
+      - '_APP_WORKER_SCREENSHOTS_ROUTER=${_APP_WORKER_SCREENSHOTS_ROUTER:-http://appwrite}'
+      - '_APP_NOTIFICATIONS_TRACKING_SECRET=${_APP_NOTIFICATIONS_TRACKING_SECRET:-$SERVICE_PASSWORD_64_NOTIFICATIONS}'
+      - '_APP_SYSTEM_EMAIL_NAME=${_APP_SYSTEM_EMAIL_NAME:-Appwrite}'
+      - '_APP_SYSTEM_EMAIL_ADDRESS=${_APP_SYSTEM_EMAIL_ADDRESS:-noreply@appwrite.io}'
+      - '_APP_SMTP_HOST=${_APP_SMTP_HOST:-}'
+      - '_APP_SMTP_PORT=${_APP_SMTP_PORT:-}'
+      - '_APP_SMTP_SECURE=${_APP_SMTP_SECURE:-}'
+      - '_APP_SMTP_USERNAME=${_APP_SMTP_USERNAME:-}'
+      - '_APP_SMTP_PASSWORD=${_APP_SMTP_PASSWORD:-}'
+      - '_APP_SMS_FROM=${_APP_SMS_FROM:-}'
+      - '_APP_SMS_PROVIDER=${_APP_SMS_PROVIDER:-}'
+      - '_APP_SMS_PROJECTS_DENY_LIST=${_APP_SMS_PROJECTS_DENY_LIST:-}'
+      - '_APP_MIGRATIONS_FIREBASE_CLIENT_ID=${_APP_MIGRATIONS_FIREBASE_CLIENT_ID:-}'
+      - '_APP_MIGRATIONS_FIREBASE_CLIENT_SECRET=${_APP_MIGRATIONS_FIREBASE_CLIENT_SECRET:-}'
+      - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
+      - '_APP_MAINTENANCE_RETENTION_AUDIT=${_APP_MAINTENANCE_RETENTION_AUDIT:-1209600}'
+      - '_APP_MAINTENANCE_RETENTION_AUDIT_CONSOLE=${_APP_MAINTENANCE_RETENTION_AUDIT_CONSOLE:-15778800}'
+      - '_APP_LIMIT_DATABASE_BATCH=${_APP_LIMIT_DATABASE_BATCH:-}'
+      - '_APP_DOCUMENTSDB=${_APP_DOCUMENTSDB:-disabled}'
+      - '_APP_VECTORSDB=${_APP_VECTORSDB:-disabled}'
+      - '_APP_EMBEDDING=${_APP_EMBEDDING:-disabled}'
+
+  appwrite-task-scheduler:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    entrypoint: schedule
+    profiles:
+      - combined
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - '${_APP_DB_HOST:-postgresql}'
+      - redis
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_POOL_SIZE_USAGE=${_APP_POOL_SIZE_USAGE:-2}'
+      - '_APP_EXECUTIONS_DUAL_WRITE=${_APP_EXECUTIONS_DUAL_WRITE:-enabled}'
+      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_POOL_SIZE_EXECUTIONS=${_APP_POOL_SIZE_EXECUTIONS:-2}'
+      - '_APP_MAINTENANCE_RETENTION_USAGE_TTL=${_APP_MAINTENANCE_RETENTION_USAGE_TTL:-180}'
+      - '_APP_STATS_USAGE_QUEUE_NAME=${_APP_STATS_USAGE_QUEUE_NAME:-v1-stats-usage}'
+      - '_APP_STATS_RESOURCES_QUEUE_NAME=${_APP_STATS_RESOURCES_QUEUE_NAME:-v1-stats-resources}'
+      - '_APP_STATS_RESOURCES_INTERVAL=${_APP_STATS_RESOURCES_INTERVAL:-3600}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      # Combined mode runs functions/executions/messages timers + enqueue coroutines
+      # against shared console/cache pools; floor must cover concurrent ticks.
+      - _APP_WORKER_MAX_COROUTINES=8
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
+      - '_APP_CONSOLE_SCHEMA=${_APP_CONSOLE_SCHEMA:-}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - '_APP_FUNCTIONS_SCHEDULE_SPREAD=${_APP_FUNCTIONS_SCHEDULE_SPREAD:-}'
+
+  # --------------------------------------------------------------------------
+  # SEPARATE topology (profile `separate`) - dedicated containers per queue /
+  # timer so hot ones can be scaled or tuned on their own.
+  # --------------------------------------------------------------------------
+  appwrite-worker-stats-usage:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-stats-usage
+    container_name: appwrite-worker-stats-usage
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_POOL_SIZE_USAGE=${_APP_POOL_SIZE_USAGE:-2}'
+      - '_APP_STATS_USAGE_QUEUE_NAME=${_APP_STATS_USAGE_QUEUE_NAME:-v1-stats-usage}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_WORKERS_NUM=1
+      # Pool sizing mirrors the combined worker.
+      - _APP_WORKER_MAX_COROUTINES=78
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-worker-stats-resources:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-stats-resources
+    container_name: appwrite-worker-stats-resources
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_STATS_RESOURCES_QUEUE_NAME=${_APP_STATS_RESOURCES_QUEUE_NAME:-v1-stats-resources}'
+      - '_APP_STATS_RESOURCES_INTERVAL=${_APP_STATS_RESOURCES_INTERVAL:-3600}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_WORKERS_NUM=1
+      # Pool sizing mirrors the combined worker.
+      - _APP_WORKER_MAX_COROUTINES=78
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-task-stats-resources:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: stats-resources
+    container_name: appwrite-task-stats-resources
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - '${_APP_DB_HOST:-postgresql}'
+      - redis
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
+      - '_APP_STATS_RESOURCES_QUEUE_NAME=${_APP_STATS_RESOURCES_QUEUE_NAME:-v1-stats-resources}'
+      - '_APP_STATS_RESOURCES_INTERVAL=${_APP_STATS_RESOURCES_INTERVAL:-3600}'
+      # Pool sizing mirrors the combined scheduler.
+      - _APP_WORKER_MAX_COROUTINES=8
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-worker-webhooks:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-webhooks
+    container_name: appwrite-worker-webhooks
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=8
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_EMAIL_SECURITY=${_APP_EMAIL_SECURITY:-security@appwrite.io}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_WEBHOOK_MAX_FAILED_ATTEMPTS=${_APP_WEBHOOK_MAX_FAILED_ATTEMPTS:-10}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - _APP_CONSOLE_URL_SCHEME=root
+
+  appwrite-worker-deletes:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-deletes
+    container_name: appwrite-worker-deletes
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    volumes:
+      - appwrite-uploads:/storage/uploads:rw
+      - appwrite-cache:/storage/cache:rw
+      - appwrite-functions:/storage/functions:rw
+      - appwrite-sites:/storage/sites:rw
+      - appwrite-builds:/storage/builds:rw
+      - appwrite-certificates:/storage/certificates:rw
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_EXECUTIONS_DUAL_WRITE=${_APP_EXECUTIONS_DUAL_WRITE:-enabled}'
+      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_POOL_SIZE_EXECUTIONS=${_APP_POOL_SIZE_EXECUTIONS:-2}'
+      - '_APP_MAINTENANCE_RETENTION_EXECUTION=${_APP_MAINTENANCE_RETENTION_EXECUTION:-1209600}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=8
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
+      - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
+      - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
+      - '_APP_DB_SCHEMA_VECTORSDB=${_APP_DB_SCHEMA_VECTORSDB:-}'
+      - '_APP_DB_USER_VECTORSDB=${_APP_DB_USER_VECTORSDB:-}'
+      - '_APP_DB_PASS_VECTORSDB=${_APP_DB_PASS_VECTORSDB:-}'
+      - '_APP_DB_ADAPTER_DOCUMENTSDB=${_APP_DB_ADAPTER_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_HOST_DOCUMENTSDB=${_APP_DB_HOST_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_PORT_DOCUMENTSDB=${_APP_DB_PORT_DOCUMENTSDB:-27017}'
+      - '_APP_DB_SCHEMA_DOCUMENTSDB=${_APP_DB_SCHEMA_DOCUMENTSDB:-}'
+      - '_APP_DB_USER_DOCUMENTSDB=${_APP_DB_USER_DOCUMENTSDB:-}'
+      - '_APP_DB_PASS_DOCUMENTSDB=${_APP_DB_PASS_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_DOCUMENTSDB=${_APP_CONNECTIONS_DATABASE_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_VECTORSDB=${_APP_CONNECTIONS_DATABASE_VECTORSDB:-}'
+      - '_APP_STORAGE_DEVICE=${_APP_STORAGE_DEVICE:-Local}'
+      - '_APP_STORAGE_S3_ACCESS_KEY=${_APP_STORAGE_S3_ACCESS_KEY:-}'
+      - '_APP_STORAGE_S3_SECRET=${_APP_STORAGE_S3_SECRET:-}'
+      - '_APP_STORAGE_S3_REGION=${_APP_STORAGE_S3_REGION:-us-east-1}'
+      - '_APP_STORAGE_S3_BUCKET=${_APP_STORAGE_S3_BUCKET:-}'
+      - '_APP_STORAGE_S3_ENDPOINT=${_APP_STORAGE_S3_ENDPOINT:-}'
+      - '_APP_STORAGE_DO_SPACES_ACCESS_KEY=${_APP_STORAGE_DO_SPACES_ACCESS_KEY:-}'
+      - '_APP_STORAGE_DO_SPACES_SECRET=${_APP_STORAGE_DO_SPACES_SECRET:-}'
+      - '_APP_STORAGE_DO_SPACES_REGION=${_APP_STORAGE_DO_SPACES_REGION:-us-east-1}'
+      - '_APP_STORAGE_DO_SPACES_BUCKET=${_APP_STORAGE_DO_SPACES_BUCKET:-}'
+      - '_APP_STORAGE_BACKBLAZE_ACCESS_KEY=${_APP_STORAGE_BACKBLAZE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_BACKBLAZE_SECRET=${_APP_STORAGE_BACKBLAZE_SECRET:-}'
+      - '_APP_STORAGE_BACKBLAZE_REGION=${_APP_STORAGE_BACKBLAZE_REGION:-us-west-004}'
+      - '_APP_STORAGE_BACKBLAZE_BUCKET=${_APP_STORAGE_BACKBLAZE_BUCKET:-}'
+      - '_APP_STORAGE_LINODE_ACCESS_KEY=${_APP_STORAGE_LINODE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_LINODE_SECRET=${_APP_STORAGE_LINODE_SECRET:-}'
+      - '_APP_STORAGE_LINODE_REGION=${_APP_STORAGE_LINODE_REGION:-eu-central-1}'
+      - '_APP_STORAGE_LINODE_BUCKET=${_APP_STORAGE_LINODE_BUCKET:-}'
+      - '_APP_STORAGE_WASABI_ACCESS_KEY=${_APP_STORAGE_WASABI_ACCESS_KEY:-}'
+      - '_APP_STORAGE_WASABI_SECRET=${_APP_STORAGE_WASABI_SECRET:-}'
+      - '_APP_STORAGE_WASABI_REGION=${_APP_STORAGE_WASABI_REGION:-eu-central-1}'
+      - '_APP_STORAGE_WASABI_BUCKET=${_APP_STORAGE_WASABI_BUCKET:-}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_EXECUTOR_SECRET=${_APP_EXECUTOR_SECRET:-$SERVICE_PASSWORD_64_EXECUTOR}'
+      - '_APP_EXECUTOR_HOST=${_APP_EXECUTOR_HOST:-http://openruntimes-executor/v1}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - '_APP_EMAIL_CERTIFICATES=${_APP_EMAIL_CERTIFICATES:-certificates@appwrite.io}'
+      - '_APP_MAINTENANCE_RETENTION_AUDIT=${_APP_MAINTENANCE_RETENTION_AUDIT:-1209600}'
+      - '_APP_MAINTENANCE_RETENTION_AUDIT_CONSOLE=${_APP_MAINTENANCE_RETENTION_AUDIT_CONSOLE:-15778800}'
+
+  appwrite-worker-databases:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-databases
+    container_name: appwrite-worker-databases
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=1
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
+      - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
+      - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
+      - '_APP_DB_SCHEMA_VECTORSDB=${_APP_DB_SCHEMA_VECTORSDB:-}'
+      - '_APP_DB_USER_VECTORSDB=${_APP_DB_USER_VECTORSDB:-}'
+      - '_APP_DB_PASS_VECTORSDB=${_APP_DB_PASS_VECTORSDB:-}'
+      - '_APP_DB_ADAPTER_DOCUMENTSDB=${_APP_DB_ADAPTER_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_HOST_DOCUMENTSDB=${_APP_DB_HOST_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_PORT_DOCUMENTSDB=${_APP_DB_PORT_DOCUMENTSDB:-27017}'
+      - '_APP_DB_SCHEMA_DOCUMENTSDB=${_APP_DB_SCHEMA_DOCUMENTSDB:-}'
+      - '_APP_DB_USER_DOCUMENTSDB=${_APP_DB_USER_DOCUMENTSDB:-}'
+      - '_APP_DB_PASS_DOCUMENTSDB=${_APP_DB_PASS_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_DOCUMENTSDB=${_APP_CONNECTIONS_DATABASE_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_VECTORSDB=${_APP_CONNECTIONS_DATABASE_VECTORSDB:-}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_QUEUE_NAME=${_APP_QUEUE_NAME:-}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - '_APP_LIMIT_DATABASE_BATCH=${_APP_LIMIT_DATABASE_BATCH:-}'
+      - '_APP_DOCUMENTSDB=${_APP_DOCUMENTSDB:-disabled}'
+      - '_APP_VECTORSDB=${_APP_VECTORSDB:-disabled}'
+      - '_APP_EMBEDDING=${_APP_EMBEDDING:-disabled}'
+
+  appwrite-worker-builds:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-builds
+    container_name: appwrite-worker-builds
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    volumes:
+      - appwrite-functions:/storage/functions:rw
+      - appwrite-sites:/storage/sites:rw
+      - appwrite-builds:/storage/builds:rw
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=8
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_EXECUTOR_SECRET=${_APP_EXECUTOR_SECRET:-$SERVICE_PASSWORD_64_EXECUTOR}'
+      - '_APP_EXECUTOR_HOST=${_APP_EXECUTOR_HOST:-http://openruntimes-executor/v1}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_VCS_GITHUB_APP_NAME=${_APP_VCS_GITHUB_APP_NAME:-}'
+      - '_APP_VCS_GITHUB_PRIVATE_KEY=${_APP_VCS_GITHUB_PRIVATE_KEY:-disabled}'
+      - '_APP_VCS_GITHUB_APP_ID=${_APP_VCS_GITHUB_APP_ID:-}'
+      - '_APP_VCS_GITEA_ENDPOINT=${_APP_VCS_GITEA_ENDPOINT:-}'
+      - '_APP_VCS_GITEA_BROWSER_ENDPOINT=${_APP_VCS_GITEA_BROWSER_ENDPOINT:-}'
+      - '_APP_VCS_GITEA_CLIENT_ID=${_APP_VCS_GITEA_CLIENT_ID:-}'
+      - '_APP_VCS_GITEA_CLIENT_SECRET=${_APP_VCS_GITEA_CLIENT_SECRET:-}'
+      - '_APP_VCS_GITEA_WEBHOOK_SECRET=${_APP_VCS_GITEA_WEBHOOK_SECRET:-}'
+      - '_APP_VCS_GITLAB_ENDPOINT=${_APP_VCS_GITLAB_ENDPOINT:-}'
+      - '_APP_VCS_GITLAB_CLIENT_ID=${_APP_VCS_GITLAB_CLIENT_ID:-}'
+      - '_APP_VCS_GITLAB_CLIENT_SECRET=${_APP_VCS_GITLAB_CLIENT_SECRET:-}'
+      - '_APP_VCS_GITLAB_WEBHOOK_SECRET=${_APP_VCS_GITLAB_WEBHOOK_SECRET:-}'
+      - '_APP_VCS_BITBUCKET_CLIENT_ID=${_APP_VCS_BITBUCKET_CLIENT_ID:-}'
+      - '_APP_VCS_BITBUCKET_CLIENT_SECRET=${_APP_VCS_BITBUCKET_CLIENT_SECRET:-}'
+      - '_APP_VCS_BITBUCKET_WEBHOOK_SECRET=${_APP_VCS_BITBUCKET_WEBHOOK_SECRET:-}'
+      - '_APP_VCS_ORIGIN_CLIENT_ID=${_APP_VCS_ORIGIN_CLIENT_ID:-}'
+      - '_APP_VCS_ORIGIN_PRIVATE_KEY=${_APP_VCS_ORIGIN_PRIVATE_KEY:-}'
+      - '_APP_VCS_WEBHOOK_URL=${_APP_VCS_WEBHOOK_URL:-http://appwrite/v1}'
+      - '_APP_FUNCTIONS_TIMEOUT=${_APP_FUNCTIONS_TIMEOUT:-900}'
+      - '_APP_SITES_TIMEOUT=${_APP_SITES_TIMEOUT:-60}'
+      - '_APP_COMPUTE_BUILD_TIMEOUT=${_APP_COMPUTE_BUILD_TIMEOUT:-900}'
+      - '_APP_COMPUTE_CPUS=${_APP_COMPUTE_CPUS:-0}'
+      - '_APP_COMPUTE_MEMORY=${_APP_COMPUTE_MEMORY:-0}'
+      - '_APP_OPEN_RUNTIMES_NFT=${_APP_OPEN_RUNTIMES_NFT:-enabled}'
+      - '_APP_COMPUTE_SIZE_LIMIT=${_APP_COMPUTE_SIZE_LIMIT:-30000000}'
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_OPTIONS_ROUTER_FORCE_HTTPS=${_APP_OPTIONS_ROUTER_FORCE_HTTPS:-disabled}'
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
+      - _APP_CONSOLE_URL_SCHEME=root
+      - '_APP_CONSOLE_TRUSTED_PROJECTS=${_APP_CONSOLE_TRUSTED_PROJECTS:-}'
+      - '_APP_STORAGE_DEVICE=${_APP_STORAGE_DEVICE:-Local}'
+      - '_APP_STORAGE_S3_ACCESS_KEY=${_APP_STORAGE_S3_ACCESS_KEY:-}'
+      - '_APP_STORAGE_S3_SECRET=${_APP_STORAGE_S3_SECRET:-}'
+      - '_APP_STORAGE_S3_REGION=${_APP_STORAGE_S3_REGION:-us-east-1}'
+      - '_APP_STORAGE_S3_BUCKET=${_APP_STORAGE_S3_BUCKET:-}'
+      - '_APP_STORAGE_S3_ENDPOINT=${_APP_STORAGE_S3_ENDPOINT:-}'
+      - '_APP_STORAGE_DO_SPACES_ACCESS_KEY=${_APP_STORAGE_DO_SPACES_ACCESS_KEY:-}'
+      - '_APP_STORAGE_DO_SPACES_SECRET=${_APP_STORAGE_DO_SPACES_SECRET:-}'
+      - '_APP_STORAGE_DO_SPACES_REGION=${_APP_STORAGE_DO_SPACES_REGION:-us-east-1}'
+      - '_APP_STORAGE_DO_SPACES_BUCKET=${_APP_STORAGE_DO_SPACES_BUCKET:-}'
+      - '_APP_STORAGE_BACKBLAZE_ACCESS_KEY=${_APP_STORAGE_BACKBLAZE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_BACKBLAZE_SECRET=${_APP_STORAGE_BACKBLAZE_SECRET:-}'
+      - '_APP_STORAGE_BACKBLAZE_REGION=${_APP_STORAGE_BACKBLAZE_REGION:-us-west-004}'
+      - '_APP_STORAGE_BACKBLAZE_BUCKET=${_APP_STORAGE_BACKBLAZE_BUCKET:-}'
+      - '_APP_STORAGE_LINODE_ACCESS_KEY=${_APP_STORAGE_LINODE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_LINODE_SECRET=${_APP_STORAGE_LINODE_SECRET:-}'
+      - '_APP_STORAGE_LINODE_REGION=${_APP_STORAGE_LINODE_REGION:-eu-central-1}'
+      - '_APP_STORAGE_LINODE_BUCKET=${_APP_STORAGE_LINODE_BUCKET:-}'
+      - '_APP_STORAGE_WASABI_ACCESS_KEY=${_APP_STORAGE_WASABI_ACCESS_KEY:-}'
+      - '_APP_STORAGE_WASABI_SECRET=${_APP_STORAGE_WASABI_SECRET:-}'
+      - '_APP_STORAGE_WASABI_REGION=${_APP_STORAGE_WASABI_REGION:-eu-central-1}'
+      - '_APP_STORAGE_WASABI_BUCKET=${_APP_STORAGE_WASABI_BUCKET:-}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_BUILDS_VOLUME=${_APP_BUILDS_VOLUME:-appwrite-builds}'
+      - '_APP_JOBS_HOST=${_APP_JOBS_HOST:-http://orchestrator:8080}'
+      - '_APP_JOBS_SECRET=${_APP_JOBS_SECRET:-$SERVICE_PASSWORD_64_JOBS}'
+      - '_APP_JOBS_ENDPOINT=${_APP_JOBS_ENDPOINT:-http://appwrite}'
+
+  appwrite-worker-jobs:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-jobs
+    container_name: appwrite-worker-jobs
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    volumes:
+      - appwrite-builds:/storage/builds:rw
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=8
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_STORAGE_DEVICE=${_APP_STORAGE_DEVICE:-Local}'
+      - '_APP_STORAGE_S3_ACCESS_KEY=${_APP_STORAGE_S3_ACCESS_KEY:-}'
+      - '_APP_STORAGE_S3_SECRET=${_APP_STORAGE_S3_SECRET:-}'
+      - '_APP_STORAGE_S3_REGION=${_APP_STORAGE_S3_REGION:-us-east-1}'
+      - '_APP_STORAGE_S3_BUCKET=${_APP_STORAGE_S3_BUCKET:-}'
+      - '_APP_STORAGE_S3_ENDPOINT=${_APP_STORAGE_S3_ENDPOINT:-}'
+      - '_APP_STORAGE_DO_SPACES_ACCESS_KEY=${_APP_STORAGE_DO_SPACES_ACCESS_KEY:-}'
+      - '_APP_STORAGE_DO_SPACES_SECRET=${_APP_STORAGE_DO_SPACES_SECRET:-}'
+      - '_APP_STORAGE_DO_SPACES_REGION=${_APP_STORAGE_DO_SPACES_REGION:-us-east-1}'
+      - '_APP_STORAGE_DO_SPACES_BUCKET=${_APP_STORAGE_DO_SPACES_BUCKET:-}'
+      - '_APP_STORAGE_BACKBLAZE_ACCESS_KEY=${_APP_STORAGE_BACKBLAZE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_BACKBLAZE_SECRET=${_APP_STORAGE_BACKBLAZE_SECRET:-}'
+      - '_APP_STORAGE_BACKBLAZE_REGION=${_APP_STORAGE_BACKBLAZE_REGION:-us-west-004}'
+      - '_APP_STORAGE_BACKBLAZE_BUCKET=${_APP_STORAGE_BACKBLAZE_BUCKET:-}'
+      - '_APP_STORAGE_LINODE_ACCESS_KEY=${_APP_STORAGE_LINODE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_LINODE_SECRET=${_APP_STORAGE_LINODE_SECRET:-}'
+      - '_APP_STORAGE_LINODE_REGION=${_APP_STORAGE_LINODE_REGION:-eu-central-1}'
+      - '_APP_STORAGE_LINODE_BUCKET=${_APP_STORAGE_LINODE_BUCKET:-}'
+      - '_APP_STORAGE_WASABI_ACCESS_KEY=${_APP_STORAGE_WASABI_ACCESS_KEY:-}'
+      - '_APP_STORAGE_WASABI_SECRET=${_APP_STORAGE_WASABI_SECRET:-}'
+      - '_APP_STORAGE_WASABI_REGION=${_APP_STORAGE_WASABI_REGION:-eu-central-1}'
+      - '_APP_STORAGE_WASABI_BUCKET=${_APP_STORAGE_WASABI_BUCKET:-}'
+      - '_APP_JOBS_HOST=${_APP_JOBS_HOST:-http://orchestrator:8080}'
+      - '_APP_JOBS_SECRET=${_APP_JOBS_SECRET:-$SERVICE_PASSWORD_64_JOBS}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-worker-screenshots:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-screenshots
+    container_name: appwrite-worker-screenshots
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    volumes:
+      - appwrite-uploads:/storage/uploads:rw
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    environment:
+      - '_APP_BROWSER_HOST=${_APP_BROWSER_HOST:-http://appwrite-browser:3000/v1}'
+      - '_APP_SITES_TIMEOUT=${_APP_SITES_TIMEOUT:-60}'
+      - '_APP_WORKER_SCREENSHOTS_ROUTER=${_APP_WORKER_SCREENSHOTS_ROUTER:-http://appwrite}'
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=8
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - '_APP_STORAGE_DEVICE=${_APP_STORAGE_DEVICE:-Local}'
+      - '_APP_STORAGE_S3_ACCESS_KEY=${_APP_STORAGE_S3_ACCESS_KEY:-}'
+      - '_APP_STORAGE_S3_SECRET=${_APP_STORAGE_S3_SECRET:-}'
+      - '_APP_STORAGE_S3_REGION=${_APP_STORAGE_S3_REGION:-us-east-1}'
+      - '_APP_STORAGE_S3_BUCKET=${_APP_STORAGE_S3_BUCKET:-}'
+      - '_APP_STORAGE_S3_ENDPOINT=${_APP_STORAGE_S3_ENDPOINT:-}'
+      - '_APP_STORAGE_DO_SPACES_ACCESS_KEY=${_APP_STORAGE_DO_SPACES_ACCESS_KEY:-}'
+      - '_APP_STORAGE_DO_SPACES_SECRET=${_APP_STORAGE_DO_SPACES_SECRET:-}'
+      - '_APP_STORAGE_DO_SPACES_REGION=${_APP_STORAGE_DO_SPACES_REGION:-us-east-1}'
+      - '_APP_STORAGE_DO_SPACES_BUCKET=${_APP_STORAGE_DO_SPACES_BUCKET:-}'
+      - '_APP_STORAGE_BACKBLAZE_ACCESS_KEY=${_APP_STORAGE_BACKBLAZE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_BACKBLAZE_SECRET=${_APP_STORAGE_BACKBLAZE_SECRET:-}'
+      - '_APP_STORAGE_BACKBLAZE_REGION=${_APP_STORAGE_BACKBLAZE_REGION:-us-west-004}'
+      - '_APP_STORAGE_BACKBLAZE_BUCKET=${_APP_STORAGE_BACKBLAZE_BUCKET:-}'
+      - '_APP_STORAGE_LINODE_ACCESS_KEY=${_APP_STORAGE_LINODE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_LINODE_SECRET=${_APP_STORAGE_LINODE_SECRET:-}'
+      - '_APP_STORAGE_LINODE_REGION=${_APP_STORAGE_LINODE_REGION:-eu-central-1}'
+      - '_APP_STORAGE_LINODE_BUCKET=${_APP_STORAGE_LINODE_BUCKET:-}'
+      - '_APP_STORAGE_WASABI_ACCESS_KEY=${_APP_STORAGE_WASABI_ACCESS_KEY:-}'
+      - '_APP_STORAGE_WASABI_SECRET=${_APP_STORAGE_WASABI_SECRET:-}'
+      - '_APP_STORAGE_WASABI_REGION=${_APP_STORAGE_WASABI_REGION:-eu-central-1}'
+      - '_APP_STORAGE_WASABI_BUCKET=${_APP_STORAGE_WASABI_BUCKET:-}'
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  appwrite-worker-certificates:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-certificates
+    container_name: appwrite-worker-certificates
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    volumes:
+      - appwrite-config:/storage/config:rw
+      - appwrite-certificates:/storage/certificates:rw
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=8
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
+      - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
+      - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
+      - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
+      - '_APP_DNS=${_APP_DNS:-}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_EMAIL_CERTIFICATES=${_APP_EMAIL_CERTIFICATES:-certificates@appwrite.io}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-worker-executions:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-executions
+    container_name: appwrite-worker-executions
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_EXECUTIONS_DUAL_WRITE=${_APP_EXECUTIONS_DUAL_WRITE:-enabled}'
+      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_POOL_SIZE_EXECUTIONS=${_APP_POOL_SIZE_EXECUTIONS:-2}'
+      - '_APP_MAINTENANCE_RETENTION_EXECUTION=${_APP_MAINTENANCE_RETENTION_EXECUTION:-1209600}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=8
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-worker-functions:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-functions
+    container_name: appwrite-worker-functions
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - '${_APP_DB_HOST:-postgresql}'
+      - redis
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=8
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_FUNCTIONS_TIMEOUT=${_APP_FUNCTIONS_TIMEOUT:-900}'
+      - '_APP_SITES_TIMEOUT=${_APP_SITES_TIMEOUT:-60}'
+      - '_APP_COMPUTE_BUILD_TIMEOUT=${_APP_COMPUTE_BUILD_TIMEOUT:-900}'
+      - '_APP_COMPUTE_CPUS=${_APP_COMPUTE_CPUS:-0}'
+      - '_APP_COMPUTE_MEMORY=${_APP_COMPUTE_MEMORY:-0}'
+      - '_APP_EXECUTOR_SECRET=${_APP_EXECUTOR_SECRET:-$SERVICE_PASSWORD_64_EXECUTOR}'
+      - '_APP_EXECUTOR_HOST=${_APP_EXECUTOR_HOST:-http://openruntimes-executor/v1}'
+      - '_APP_DOCKER_HUB_USERNAME=${_APP_DOCKER_HUB_USERNAME:-}'
+      - '_APP_DOCKER_HUB_PASSWORD=${_APP_DOCKER_HUB_PASSWORD:-}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_PROVIDER=${_APP_LOGGING_PROVIDER:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-worker-mails:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-mails
+    container_name: appwrite-worker-mails
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=6
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_NOTIFICATIONS_TRACKING_SECRET=${_APP_NOTIFICATIONS_TRACKING_SECRET:-$SERVICE_PASSWORD_64_NOTIFICATIONS}'
+      - '_APP_SYSTEM_EMAIL_NAME=${_APP_SYSTEM_EMAIL_NAME:-Appwrite}'
+      - '_APP_SYSTEM_EMAIL_ADDRESS=${_APP_SYSTEM_EMAIL_ADDRESS:-noreply@appwrite.io}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_SMTP_HOST=${_APP_SMTP_HOST:-}'
+      - '_APP_SMTP_PORT=${_APP_SMTP_PORT:-}'
+      - '_APP_SMTP_SECURE=${_APP_SMTP_SECURE:-}'
+      - '_APP_SMTP_USERNAME=${_APP_SMTP_USERNAME:-}'
+      - '_APP_SMTP_PASSWORD=${_APP_SMTP_PASSWORD:-}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-worker-notifications:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-notifications
+    container_name: appwrite-worker-notifications
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - redis
+      - '${_APP_DB_HOST:-postgresql}'
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_NOTIFICATIONS_TRACKING_SECRET=${_APP_NOTIFICATIONS_TRACKING_SECRET:-$SERVICE_PASSWORD_64_NOTIFICATIONS}'
+      - '_APP_SYSTEM_EMAIL_NAME=${_APP_SYSTEM_EMAIL_NAME:-Appwrite}'
+      - '_APP_SYSTEM_EMAIL_ADDRESS=${_APP_SYSTEM_EMAIL_ADDRESS:-noreply@appwrite.io}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_SMTP_HOST=${_APP_SMTP_HOST:-}'
+      - '_APP_SMTP_PORT=${_APP_SMTP_PORT:-}'
+      - '_APP_SMTP_SECURE=${_APP_SMTP_SECURE:-}'
+      - '_APP_SMTP_USERNAME=${_APP_SMTP_USERNAME:-}'
+      - '_APP_SMTP_PASSWORD=${_APP_SMTP_PASSWORD:-}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-worker-messaging:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-messaging
+    container_name: appwrite-worker-messaging
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    volumes:
+      - appwrite-uploads:/storage/uploads:rw
+    depends_on:
+      - redis
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=1
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_SMS_FROM=${_APP_SMS_FROM:-}'
+      - '_APP_SMS_PROVIDER=${_APP_SMS_PROVIDER:-}'
+      - '_APP_SMS_PROJECTS_DENY_LIST=${_APP_SMS_PROJECTS_DENY_LIST:-}'
+      - '_APP_STORAGE_DEVICE=${_APP_STORAGE_DEVICE:-Local}'
+      - '_APP_STORAGE_S3_ACCESS_KEY=${_APP_STORAGE_S3_ACCESS_KEY:-}'
+      - '_APP_STORAGE_S3_SECRET=${_APP_STORAGE_S3_SECRET:-}'
+      - '_APP_STORAGE_S3_REGION=${_APP_STORAGE_S3_REGION:-us-east-1}'
+      - '_APP_STORAGE_S3_BUCKET=${_APP_STORAGE_S3_BUCKET:-}'
+      - '_APP_STORAGE_S3_ENDPOINT=${_APP_STORAGE_S3_ENDPOINT:-}'
+      - '_APP_STORAGE_DO_SPACES_ACCESS_KEY=${_APP_STORAGE_DO_SPACES_ACCESS_KEY:-}'
+      - '_APP_STORAGE_DO_SPACES_SECRET=${_APP_STORAGE_DO_SPACES_SECRET:-}'
+      - '_APP_STORAGE_DO_SPACES_REGION=${_APP_STORAGE_DO_SPACES_REGION:-us-east-1}'
+      - '_APP_STORAGE_DO_SPACES_BUCKET=${_APP_STORAGE_DO_SPACES_BUCKET:-}'
+      - '_APP_STORAGE_BACKBLAZE_ACCESS_KEY=${_APP_STORAGE_BACKBLAZE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_BACKBLAZE_SECRET=${_APP_STORAGE_BACKBLAZE_SECRET:-}'
+      - '_APP_STORAGE_BACKBLAZE_REGION=${_APP_STORAGE_BACKBLAZE_REGION:-us-west-004}'
+      - '_APP_STORAGE_BACKBLAZE_BUCKET=${_APP_STORAGE_BACKBLAZE_BUCKET:-}'
+      - '_APP_STORAGE_LINODE_ACCESS_KEY=${_APP_STORAGE_LINODE_ACCESS_KEY:-}'
+      - '_APP_STORAGE_LINODE_SECRET=${_APP_STORAGE_LINODE_SECRET:-}'
+      - '_APP_STORAGE_LINODE_REGION=${_APP_STORAGE_LINODE_REGION:-eu-central-1}'
+      - '_APP_STORAGE_LINODE_BUCKET=${_APP_STORAGE_LINODE_BUCKET:-}'
+      - '_APP_STORAGE_WASABI_ACCESS_KEY=${_APP_STORAGE_WASABI_ACCESS_KEY:-}'
+      - '_APP_STORAGE_WASABI_SECRET=${_APP_STORAGE_WASABI_SECRET:-}'
+      - '_APP_STORAGE_WASABI_REGION=${_APP_STORAGE_WASABI_REGION:-eu-central-1}'
+      - '_APP_STORAGE_WASABI_BUCKET=${_APP_STORAGE_WASABI_BUCKET:-}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-worker-migrations:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: worker-migrations
+    container_name: appwrite-worker-migrations
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    volumes:
+      - appwrite-imports:/storage/imports:rw
+      - appwrite-uploads:/storage/uploads:rw
+    depends_on:
+      - '${_APP_DB_HOST:-postgresql}'
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - _APP_WORKERS_NUM=1
+      - _APP_WORKER_MAX_COROUTINES=1
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
+      - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
+      - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
+      - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
+      - '_APP_DNS=${_APP_DNS:-}'
+      - '_APP_EMAIL_SECURITY=${_APP_EMAIL_SECURITY:-security@appwrite.io}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
+      - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
+      - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
+      - '_APP_DB_SCHEMA_VECTORSDB=${_APP_DB_SCHEMA_VECTORSDB:-}'
+      - '_APP_DB_USER_VECTORSDB=${_APP_DB_USER_VECTORSDB:-}'
+      - '_APP_DB_PASS_VECTORSDB=${_APP_DB_PASS_VECTORSDB:-}'
+      - '_APP_DB_ADAPTER_DOCUMENTSDB=${_APP_DB_ADAPTER_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_HOST_DOCUMENTSDB=${_APP_DB_HOST_DOCUMENTSDB:-mongodb}'
+      - '_APP_DB_PORT_DOCUMENTSDB=${_APP_DB_PORT_DOCUMENTSDB:-27017}'
+      - '_APP_DB_SCHEMA_DOCUMENTSDB=${_APP_DB_SCHEMA_DOCUMENTSDB:-}'
+      - '_APP_DB_USER_DOCUMENTSDB=${_APP_DB_USER_DOCUMENTSDB:-}'
+      - '_APP_DB_PASS_DOCUMENTSDB=${_APP_DB_PASS_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_DOCUMENTSDB=${_APP_CONNECTIONS_DATABASE_DOCUMENTSDB:-}'
+      - '_APP_CONNECTIONS_DATABASE_VECTORSDB=${_APP_CONNECTIONS_DATABASE_VECTORSDB:-}'
+      - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_MIGRATIONS_FIREBASE_CLIENT_ID=${_APP_MIGRATIONS_FIREBASE_CLIENT_ID:-}'
+      - '_APP_MIGRATIONS_FIREBASE_CLIENT_SECRET=${_APP_MIGRATIONS_FIREBASE_CLIENT_SECRET:-}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
+
+  # --------------------------------------------------------------------------
+  # Maintenance + interval timers (always exactly one instance)
+  # --------------------------------------------------------------------------
+  appwrite-task-maintenance:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    entrypoint: maintenance
+    container_name: appwrite-task-maintenance
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - '${_APP_DB_HOST:-postgresql}'
+      - redis
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
+      - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
+      - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
+      - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
+      - '_APP_DNS=${_APP_DNS:-}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_EDITION=${_APP_EDITION:-self-hosted}'
+      - '_APP_ROUTER_AUTO_CERTIFICATES=${_APP_ROUTER_AUTO_CERTIFICATES:-}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_MAINTENANCE_INTERVAL=${_APP_MAINTENANCE_INTERVAL:-86400}'
+      - '_APP_MAINTENANCE_RETENTION_EXECUTION=${_APP_MAINTENANCE_RETENTION_EXECUTION:-1209600}'
+      - '_APP_MAINTENANCE_RETENTION_CACHE=${_APP_MAINTENANCE_RETENTION_CACHE:-2592000}'
+      - '_APP_MAINTENANCE_RETENTION_ABUSE=${_APP_MAINTENANCE_RETENTION_ABUSE:-86400}'
+      - '_APP_MAINTENANCE_RETENTION_AUDIT=${_APP_MAINTENANCE_RETENTION_AUDIT:-1209600}'
+      - '_APP_MAINTENANCE_RETENTION_AUDIT_CONSOLE=${_APP_MAINTENANCE_RETENTION_AUDIT_CONSOLE:-15778800}'
+      - '_APP_MAINTENANCE_RETENTION_USAGE_HOURLY=${_APP_MAINTENANCE_RETENTION_USAGE_HOURLY:-8640000}'
+      - '_APP_MAINTENANCE_RETENTION_SCHEDULES=${_APP_MAINTENANCE_RETENTION_SCHEDULES:-86400}'
+      - '_APP_MAINTENANCE_START_TIME=${_APP_MAINTENANCE_START_TIME:-}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-task-interval:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    entrypoint: interval
+    container_name: appwrite-task-interval
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - '${_APP_DB_HOST:-postgresql}'
+      - redis
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
+      - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
+      - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
+      - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
+      - '_APP_DNS=${_APP_DNS:-}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - '_APP_INTERVAL_DOMAIN_VERIFICATION=${_APP_INTERVAL_DOMAIN_VERIFICATION:-120}'
+      - '_APP_INTERVAL_CLEANUP_STALE_EXECUTIONS=${_APP_INTERVAL_CLEANUP_STALE_EXECUTIONS:-300}'
+
+  appwrite-task-scheduler-functions:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: schedule-functions
+    container_name: appwrite-task-scheduler-functions
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - '${_APP_DB_HOST:-postgresql}'
+      - redis
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
+      - '_APP_CONSOLE_SCHEMA=${_APP_CONSOLE_SCHEMA:-}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+      - '_APP_FUNCTIONS_SCHEDULE_SPREAD=${_APP_FUNCTIONS_SCHEDULE_SPREAD:-}'
+
+  appwrite-task-scheduler-executions:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: schedule-executions
+    container_name: appwrite-task-scheduler-executions
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - '${_APP_DB_HOST:-postgresql}'
+      - redis
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
+      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
+      - '_APP_CONSOLE_SCHEMA=${_APP_CONSOLE_SCHEMA:-}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  appwrite-task-scheduler-messages:
+    image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
+    profiles:
+      - separate
+    exclude_from_hc: true
+    entrypoint: schedule-messages
+    container_name: appwrite-task-scheduler-messages
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    depends_on:
+      - '${_APP_DB_HOST:-postgresql}'
+      - redis
+    environment:
+      - '_APP_ENV=${_APP_ENV:-production}'
+      - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
+      - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
+      - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
+      - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
+      - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
+      - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
+      - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
+      - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
+      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
+
+  # --------------------------------------------------------------------------
+  # Assistant (Console AI - needs _APP_ASSISTANT_OPENAI_API_KEY)
+  # --------------------------------------------------------------------------
+  appwrite-assistant:
+    image: 'appwrite/assistant:0.8.4'
+    container_name: appwrite-assistant
+    restart: unless-stopped
+    networks:
+      - appwrite
+    environment:
+      - '_APP_ASSISTANT_OPENAI_API_KEY=${_APP_ASSISTANT_OPENAI_API_KEY:-}'
+
+  # Headless browser for Sites screenshots/SSR
+  appwrite-browser:
+    image: 'appwrite/browser:0.3.4'
+    container_name: appwrite-browser
+    restart: unless-stopped
+    networks:
+      - appwrite
+
+  # --------------------------------------------------------------------------
+  # ClickHouse - usage stats + optional execution logs dual-write
+  # --------------------------------------------------------------------------
+  clickhouse:
+    image: 'clickhouse/clickhouse-server:26.4.3-alpine'
+    container_name: appwrite-clickhouse
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    environment:
+      - CLICKHOUSE_DB=appwrite
+      - CLICKHOUSE_USER=appwrite
+      - CLICKHOUSE_PASSWORD=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - appwrite-clickhouse:/var/lib/clickhouse:rw
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'clickhouse-client --user "$$CLICKHOUSE_USER" --password "$$CLICKHOUSE_PASSWORD" --query "SELECT 1" >/dev/null'
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # Geo service (IP geolocation)
+  # --------------------------------------------------------------------------
+  appwrite-geo:
+    image: 'appwrite/geo:0.3.1'
+    container_name: appwrite-geo
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    environment:
+      - 'GEO_SECRET=${_APP_GEO_SECRET:-$SERVICE_PASSWORD_64_GEO}'
+    healthcheck:
+      test: 'php -r "exit(json_decode(file_get_contents(''http://localhost/v1/health''))->status === ''ok'' ? 0 : 1);"'
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  # Executor - runs function/site containers (needs docker.sock)
+  # --------------------------------------------------------------------------
+  openruntimes-executor:
+    image: 'openruntimes/executor:0.29.0'
+    # No container_name: Coolify rewrites container names on deploy, and the
+    # executor locates its own container by hostname (Docker partial name
+    # match). The hostname must be a substring of the final container name -
+    # the service name is, under both Coolify and plain compose.
+    hostname: openruntimes-executor
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    stop_signal: SIGINT
+    networks:
+      - appwrite
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - appwrite-builds:/storage/builds:rw
+      - appwrite-functions:/storage/functions:rw
+      - appwrite-sites:/storage/sites:rw
+      - /tmp:/tmp:rw
+    environment:
+      - OPR_EXECUTOR_IMAGES=${_APP_EXECUTOR_IMAGES:-openruntimes/node:v5-22,openruntimes/static:v5-1}
+      - OPR_EXECUTOR_INACTIVE_THRESHOLD=${_APP_COMPUTE_INACTIVE_THRESHOLD:-600}
+      - OPR_EXECUTOR_MAINTENANCE_INTERVAL=${_APP_COMPUTE_MAINTENANCE_INTERVAL:-600}
+      - OPR_EXECUTOR_NETWORK=${_APP_COMPUTE_RUNTIMES_NETWORK:-runtimes}
+      - OPR_EXECUTOR_DOCKER_HUB_USERNAME=${_APP_DOCKER_HUB_USERNAME:-}
+      - OPR_EXECUTOR_DOCKER_HUB_PASSWORD=${_APP_DOCKER_HUB_PASSWORD:-}
+      - OPR_EXECUTOR_ENV=${_APP_ENV:-production}
+      - OPR_EXECUTOR_RUNTIMES=${_APP_FUNCTIONS_RUNTIMES:-node-22},${_APP_SITES_RUNTIMES:-static-1,node-22}
+      - OPR_EXECUTOR_SECRET=${_APP_EXECUTOR_SECRET:-$SERVICE_PASSWORD_64_EXECUTOR}
+      - OPR_EXECUTOR_RUNTIME_VERSIONS=v5
+      - OPEN_RUNTIMES_NFT=${_APP_OPEN_RUNTIMES_NFT:-enabled}
+      - OPR_EXECUTOR_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}
+      - OPR_EXECUTOR_CONNECTION_STORAGE=${_APP_EXECUTOR_CONNECTION_STORAGE:-local://localhost}
+      - OPR_EXECUTOR_CONNECTION_BUILD_CACHE_STORAGE=
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'curl -fsS -H "Authorization: Bearer $$OPR_EXECUTOR_SECRET" http://localhost/v1/health >/dev/null'
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  # --------------------------------------------------------------------------
+  # Orchestrator - build jobs backend for functions/sites (needs docker.sock)
+  # --------------------------------------------------------------------------
+  orchestrator:
+    image: 'ghcr.io/open-runtimes/orchestrator/orchestrator:1.9.2'
+    container_name: orchestrator
+    hostname: orchestrator
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    user: root
+    networks:
+      - appwrite
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - ORCHESTRATOR_BACKEND=docker
+      # The jobs plane and the serving planes read the network under different
+      # names; both name the network the workload containers join.
+      - ORCHESTRATOR_NETWORK=appwrite
+      - DOCKER_NETWORK=appwrite
+      - ARTIFACT_ENDPOINT=http://orchestrator:8080
+      - S3_ENDPOINT=${_APP_STORAGE_S3_ENDPOINT:-}
+      - S3_REGION=${_APP_STORAGE_S3_REGION:-us-east-1}
+      - S3_ACCESS_KEY_ID=${_APP_STORAGE_S3_ACCESS_KEY:-}
+      - S3_SECRET_ACCESS_KEY=${_APP_STORAGE_S3_SECRET:-}
+
+  # --------------------------------------------------------------------------
+  # Databases
+  # --------------------------------------------------------------------------
+  postgresql:
+    image: 'appwrite/postgres:0.1.0'
+    container_name: appwrite-postgresql
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    volumes:
+      - appwrite-postgresql:/var/lib/postgresql:rw
+    environment:
+      - POSTGRES_DB=${_APP_DB_SCHEMA:-appwrite}
+      - POSTGRES_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}
+      - POSTGRES_PASSWORD=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${_APP_DB_USER:-$SERVICE_USER_POSTGRES} -d ${_APP_DB_SCHEMA:-appwrite}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    command:
+      - postgres
+
+  # MongoDB for DocumentsDB (profile `mongodb` + _APP_DOCUMENTSDB=enabled)
+  mongodb:
+    image: 'mongo:8.2.5'
+    container_name: appwrite-mongodb
+    profiles:
+      - mongodb
+    exclude_from_hc: true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    networks:
+      - appwrite
+    volumes:
+      - appwrite-mongodb:/data/db
+      - appwrite-mongodb-keyfile:/data/keyfile
+    configs:
+      - source: mongo-init-js
+        target: /docker-entrypoint-initdb.d/mongo-init.js
+      - source: mongo-entrypoint-sh
+        target: /mongo-entrypoint.sh
+        mode: 0755
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=root
+      - MONGO_INITDB_ROOT_PASSWORD=${_APP_DB_ROOT_PASS:-$SERVICE_PASSWORD_64_MONGODBROOT}
+      - MONGO_INITDB_DATABASE=${_APP_DB_SCHEMA:-appwrite}
+      - MONGO_INITDB_USERNAME=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}
+      - MONGO_INITDB_PASSWORD=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}
+    entrypoint:
+      - /bin/bash
+      - /mongo-entrypoint.sh
+    healthcheck:
+      test: |
+        bash -c "
+          mongosh -u root -p ${_APP_DB_ROOT_PASS:-$SERVICE_PASSWORD_64_MONGODBROOT} --authenticationDatabase admin --quiet --eval \"
+            try {
+              const hello = db.adminCommand({hello: 1});
+              if (hello.isWritablePrimary && hello.setName === 'rs0') {
+                quit(0);
+              }
+            } catch (e) {}
+
+            try {
+              rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongodb:27017'}]});
+            } catch (e) {}
+
+            quit(1);
+          \" 2>/dev/null
+        "
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # Local embeddings model server (profile `embedding` + _APP_EMBEDDING=enabled)
+  appwrite-embedding:
+    image: 'appwrite/embedding:0.3.1'
+    container_name: appwrite-embedding
+    profiles:
+      - embedding
+    exclude_from_hc: true
+    restart: unless-stopped
+    environment:
+      - EMBEDDING_MODELS=${_APP_EMBEDDING_MODELS:-nomic-embed-text}
+    volumes:
+      - appwrite-models:/home/embedder/models
+    networks:
+      - appwrite
+
+  redis:
+    image: 'redis:7.4.7-alpine'
+    container_name: appwrite-redis
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-file: "5"
+        max-size: 10m
+    command:
+      - redis-server
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --maxmemory-samples
+      - "5"
+    networks:
+      - appwrite
+    volumes:
+      - appwrite-redis:/data:rw
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+# ------------------------------------------------------------------------------
+# Networks - pinned names. Function/site runtime containers spawned by the
+# executor join `runtimes`; build workers spawned by the orchestrator join
+# `appwrite`; both are created by this stack so names must stay stable.
+# Coolify's proxy is attached automatically to the `appwrite` network.
+# ------------------------------------------------------------------------------
+networks:
+  appwrite:
+    name: appwrite
+  runtimes:
+    name: runtimes
+
+# ------------------------------------------------------------------------------
+# Volumes - `appwrite-builds` keeps its pinned (unprefixed) name so the
+# orchestrator can attach it to build workers by a stable name
+# (see _APP_BUILDS_VOLUME).
+# ------------------------------------------------------------------------------
+volumes:
+  appwrite-postgresql:
+  appwrite-mongodb:
+  appwrite-mongodb-keyfile:
+  appwrite-redis:
+  appwrite-cache:
+  appwrite-clickhouse:
+  appwrite-uploads:
+  appwrite-imports:
+  appwrite-certificates:
+  appwrite-functions:
+  appwrite-sites:
+  appwrite-builds:
+    name: appwrite-builds
+  appwrite-config:
+  appwrite-models:
+
+# Mongo helper files (inline so this stays a single-file Coolify template)
+configs:
+  mongo-init-js:
+    content: |
+      // mongo-init.js
+
+      // Switch to the admin database
+      const adminDb = db.getSiblingDB('admin');
+
+      // Get username and password from environment variables
+      const username = process.env.MONGO_INITDB_USERNAME;
+      const password = process.env.MONGO_INITDB_PASSWORD;
+      const database = process.env.MONGO_INITDB_DATABASE;
+
+      // Create the user
+      adminDb.createUser({
+        user: username,
+        pwd: password,
+        roles: [
+          { role: 'readWrite', db: database }
+        ]
+      });
+  mongo-entrypoint-sh:
+    # NOTE: '$$' is escaped on purpose - compose must not interpolate the
+    # shell variables; the container receives a literal '$KEYFILE_PATH'.
+    content: |
+      #!/bin/bash
+      set -e
+
+      # Fix keyfile permissions if mounted from volume
+      KEYFILE_PATH="/data/keyfile/mongo-keyfile"
+
+      if [ ! -f "$$KEYFILE_PATH" ]; then
+        echo "Generating random MongoDB keyfile..."
+        mkdir -p /data/keyfile
+        openssl rand -base64 756 > "$$KEYFILE_PATH"
+      fi
+
+      chmod 400 "$$KEYFILE_PATH"
+      chown mongodb:mongodb "$$KEYFILE_PATH" 2>/dev/null || chown 999:999 "$$KEYFILE_PATH"
+
+      # Use MongoDB's standard entrypoint with our command
+      exec docker-entrypoint.sh mongod --replSet rs0 --bind_ip_all --auth --keyFile "$$KEYFILE_PATH"
