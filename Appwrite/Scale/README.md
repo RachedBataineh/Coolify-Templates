@@ -129,13 +129,19 @@ Appwrite officially supports horizontal scaling: stateless functions/worker cont
 
 - **API, realtime and the combined worker** are stateless/queue-competing and carry no `container_name`: replicate freely (`deploy.replicas` or `docker compose up --scale appwrite=2`), or add whole nodes (see multi-node below).
 - Raise `_APP_WORKER_MAX_COROUTINES` (default 78) for more worker throughput.
+- `_APP_WORKER_PER_CORE` (default 6) tunes worker processes per CPU core — it affects the API, realtime and executor containers; adjust to your hardware per the [official scaling docs](https://appwrite.io/docs/advanced/self-hosting/production/scaling).
 - Timers run in the `timers` profile — keep them at exactly **one** instance across your whole deployment (timers must not fire twice).
 - Never scale the executor, orchestrator or the databases.
 - Executor and orchestrator mount `/var/run/docker.sock`: they spawn function and build containers on the host, as upstream intends.
 
 ## Upgrading & notes
 
-- Bump `_APP_VERSION` in the Coolify UI and redeploy.
+- **Patch upgrades** (2.0.0 → 2.0.1): bump `_APP_VERSION` in the Coolify UI and redeploy. Check the [release notes](https://github.com/appwrite/appwrite/releases) — a migration is only required if they say so.
+- **Minor/major upgrades** (2.0 → 2.1): after bumping and redeploying, run the migration once from the server terminal:
+  ```bash
+  docker compose -f /data/coolify/services/<stack-uuid>/docker-compose.yml exec appwrite migrate
+  ```
+  (Or: `docker exec -it <appwrite-container> migrate`.) Back up the database first, and step through each minor version rather than skipping (per the [official update guide](https://appwrite.io/docs/advanced/self-hosting/production/updates)).
 - **Fresh PostgreSQL installs only.** For existing Appwrite installations, follow the official Appwrite upgrade docs — do not reuse old volumes with this file. (MariaDB installs: swap the `postgresql` service for `mariadb` and set `_APP_DB_ADAPTER=mariadb`.)
 - Set `_APP_SMTP_*` before inviting users (emails queue until then):
   ```
@@ -145,8 +151,18 @@ Appwrite officially supports horizontal scaling: stateless functions/worker cont
   _APP_SMTP_USERNAME=...
   _APP_SMTP_PASSWORD=...
   ```
-- Never rotate `_APP_OPENSSL_KEY_V1` casually: it signs API/resource tokens and encrypts OAuth2 state and encrypted columns. Back it up offline; losing it makes encrypted data unrecoverable.
-- Backups: at minimum the `appwrite-postgresql` volume (all project data) plus uploads/functions/builds/certificates volumes, and an offline copy of your environment variables.
+- Never rotate `_APP_OPENSSL_KEY_V1` casually: it signs API/resource tokens and encrypts OAuth2 state, webhook passwords, API keys and encrypted columns (per the [official security guide](https://appwrite.io/docs/advanced/self-hosting/production/security)). Back it up offline; losing it makes encrypted data unrecoverable.
+- Backups (per the [official backup guide](https://appwrite.io/docs/advanced/self-hosting/production/backups)): at minimum the `appwrite-postgresql` volume (all project data) plus uploads/functions/builds/certificates volumes, an offline copy of your environment variables, and — since the official guide only ships MariaDB/MongoDB commands — PostgreSQL directly:
+  ```bash
+  # Dump (from the server):
+  docker exec <appwrite-postgresql-container> sh -c \
+    'exec pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > appwrite-$(date +%F).sql
+
+  # Restore (fresh install only):
+  docker exec -i <appwrite-postgresql-container> sh -c \
+    'exec psql -U "$POSTGRES_USER" "$POSTGRES_DB"' < appwrite-2026-09-07.sql
+  ```
+  Test a restore periodically (official best practice: quarterly). Follow the 3-2-1 rule: 3 copies, 2 media, 1 offsite.
 
 ## Service status meanings (Coolify)
 
