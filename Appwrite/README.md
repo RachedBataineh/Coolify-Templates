@@ -6,8 +6,8 @@ A single-file Docker Compose template that runs [Appwrite](https://appwrite.io) 
 
 | File | Use it when |
 |---|---|
-| `docker-compose-appwrite-coolify-2.0.0.yaml` | **Default** — everything on one server (databases included) |
-| `docker-compose-appwrite-coolify-2.0.0-external-dbs.yaml` | **Production split** — no local PostgreSQL/Redis/ClickHouse/MongoDB; you point Appwrite at your own database servers (private network). Required env vars: `_APP_DOMAIN`, `_APP_DB_HOST`, `_APP_REDIS_HOST`, `_APP_CLICKHOUSE_HOST`, `_APP_USAGE_PASS`, plus your DB credentials (`_APP_DB_USER`, `_APP_DB_PASS`, `_APP_REDIS_USER`/`_APP_REDIS_PASS`). One-time on the Postgres server: `CREATE DATABASE appwrite;` (must match `_APP_DB_SCHEMA` — the bundled template's postgres container creates it automatically, an external server won't), then connected to that database `CREATE COLLATION IF NOT EXISTS public.utf8_ci_ai (provider = icu, locale = 'und-u-ks-level1', deterministic = false);` — Appwrite's SQL requires this collation, which the bundled `appwrite/postgres` image ships pre-created but a plain server lacks. Everything else in this README applies to both files. |
+| `docker-compose-appwrite-include-dbs.yaml` | **Default** — everything on one server (databases included) |
+| `docker-compose-appwrite-external-dbs.yaml` | **Production split** — no local PostgreSQL/Redis/ClickHouse/MongoDB; you point Appwrite at your own database servers (private network). Required env vars: `_APP_DOMAIN`, `_APP_DB_HOST`, `_APP_REDIS_HOST`, `_APP_CLICKHOUSE_HOST`, `_APP_USAGE_PASS`, plus your DB credentials (`_APP_DB_USER`, `_APP_DB_PASS`, `_APP_REDIS_USER`/`_APP_REDIS_PASS`). One-time on the Postgres server: `CREATE DATABASE appwrite;` (must match `_APP_DB_SCHEMA` — the bundled template's postgres container creates it automatically, an external server won't), then connected to that database `CREATE COLLATION IF NOT EXISTS public.utf8_ci_ai (provider = icu, locale = 'und-u-ks-level1', deterministic = false);` — Appwrite's SQL requires this collation, which the bundled `appwrite/postgres` image ships pre-created but a plain server lacks. Everything else in this README applies to both files. |
 
 ## What you get
 
@@ -39,7 +39,7 @@ fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile \
 
 ## Deploy in 5 steps
 
-1. **Create**: Coolify → New Resource → Docker Compose → paste `docker-compose-appwrite-coolify-2.0.0.yaml` → Deploy. One shared domain and all secrets are generated automatically.
+1. **Create**: Coolify → New Resource → Docker Compose → paste `docker-compose-appwrite-include-dbs.yaml` → Deploy. One shared domain and all secrets are generated automatically.
 2. **Domains**: set the same hostname on all three routed services, keeping their paths:
 
    | Service | Domain | Purpose |
