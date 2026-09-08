@@ -1,81 +1,20 @@
 # ==============================================================================
 # Appwrite 2.0 for Coolify - single-file Docker Compose template
 # ==============================================================================
-# A Coolify-ready packaging of the official Appwrite 2.0.0 compose file
-# (github.com/appwrite/appwrite, tag 2.0.0):
-#   - Coolify's proxy replaces Appwrite's own Traefik (no ports exposed)
-#   - All credentials and routing use Coolify magic variables (auto-generated)
-#   - One combined worker + scheduler by default; a per-queue worker topology,
-#     MongoDB (DocumentsDB) and an embeddings server are included behind
-#     optional compose profiles
+# Coolify-ready packaging of the official Appwrite 2.0.0 compose file.
+# Full documentation (deploy guide, profiles, scaling, troubleshooting):
+#   -> README.md
 #
-# REQUIREMENTS
-#   - A Coolify server (Docker Compose resource type)
-#   - ~2 GB RAM free for the stack; 4 GB recommended for headroom
-#   - A DNS record pointing your domain at the server
-#
-# SERVER PREP - run once on the host (not possible from a compose file):
-#   # Required by Redis (avoids startup warning and failed background saves):
-#   echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf && sysctl -p
-#   # Optional on small/shared servers - swap absorbs memory spikes instead
-#   # of triggering the OOM killer:
-#   fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile \
-#     && swapon /swapfile && echo '/swapfile none swap sw 0 0' >> /fstab
-#
-# DEPLOY IN 5 STEPS
-#   1. Coolify: New Resource -> Docker Compose -> paste this file -> Deploy.
-#      One shared domain and all secrets are generated automatically.
-#   2. In the Domains section, set the SAME hostname on all three routed
-#      services, keeping their paths:
-#        Appwrite          ->  https://your.hostname/v1           (API)
-#        Appwrite Console  ->  https://your.hostname              (dashboard)
-#        Appwrite Realtime ->  https://your.hostname/v1/realtime  (websockets)
-#   3. In the Environment tab, set (required with a custom domain):
-#        _APP_DOMAIN=your.hostname
-#      Optional, when you start using those features:
-#        _APP_DOMAIN_FUNCTIONS=functions.your.hostname
-#        _APP_DOMAIN_SITES=sites.your.hostname
-#   4. On the Appwrite AND Appwrite Realtime services: Advanced ->
-#      "Path prefixes" -> "Keep prefixes". (Coolify defaults to
-#      "Strip prefixes", which removes /v1 before forwarding - the API
-#      then 404s every request.)
-#   5. Deploy again, then register the first user - it becomes the admin.
-#
-# VERIFY after step 5:
-#   https://your.hostname/v1/health/version must return {"version":"2.0.0"}
-#   as JSON. The Appwrite service healthcheck also asserts the origin
-#   allowlist: if it turns red after a deploy, _APP_DOMAIN is missing or
-#   wrong - set it and redeploy.
-#
-# COMPOSE PROFILES (set the COMPOSE_PROFILES env var in Coolify)
-#   combined   (default) one worker + one scheduler - recommended, cheapest
-#   separate   19 dedicated workers/schedulers for per-queue scaling
-#   mongodb    adds MongoDB for DocumentsDB (+ _APP_DOCUMENTSDB=enabled)
-#   embedding  adds the local embeddings server (+ _APP_EMBEDDING=enabled)
-#   Combine freely, e.g. COMPOSE_PROFILES=separate,mongodb
-#   `separate` automatically disables the combined worker/scheduler, so
-#   queues and timers are never processed twice. Parked profile services
-#   carry `exclude_from_hc: true` so the stack status badge ignores them -
-#   remove that flag on any service you activate, so it gets monitored.
-#
-# SCALING
-#   - API, realtime and the combined worker are stateless/queue-competing
-#     and carry no container_name: replicate them freely (deploy.replicas
-#     or `docker compose up --scale appwrite=2`).
-#   - Raise _APP_WORKER_MAX_COROUTINES (default 78) for worker throughput.
-#   - Keep schedulers and timers at exactly ONE instance (timers must not
-#     fire twice) - switch to the `separate` profile instead of scaling.
-#   - Never scale the executor, orchestrator or the databases.
-#
-# UPGRADING & NOTES
-#   - Bump _APP_VERSION in the Coolify UI and redeploy to upgrade.
-#   - Fresh PostgreSQL installs only. For existing Appwrite installations,
-#     follow the official Appwrite upgrade docs - do not reuse old volumes
-#     with this file. (MariaDB installs: swap the `postgresql` service for
-#     `mariadb` and set _APP_DB_ADAPTER=mariadb.)
-#   - Set _APP_SMTP_* before inviting users (emails queue until then).
-#   - Executor and orchestrator mount /var/run/docker.sock: they spawn
-#     function and build containers on the host, as upstream intends.
+# QUICK START
+#   1. Paste this file into a Coolify Docker Compose resource -> Deploy.
+#   2. Same hostname on all three routed services, keeping paths:
+#      Appwrite /v1 | Console / | Realtime /v1/realtime
+#   3. Env tab: _APP_DOMAIN=your.hostname  (required - deploy is blocked
+#      until set)
+#   4. Appwrite + Realtime services: Advanced -> Path prefixes ->
+#      "Keep prefixes"
+#   5. Deploy, register the first user (becomes admin).
+#   Then see README.md: server prep, builds volume, sites domains, SMTP.
 # ==============================================================================
 x-logging:
   logging:
@@ -122,16 +61,18 @@ services:
       - redis
       - '${_APP_DB_HOST:-postgresql}'
       - appwrite-geo
+      - appwrite-autogravity
     environment:
       # The _80 suffix pins the Traefik backend port explicitly; without it
       # Coolify's port auto-detection can pick a wrong port and every /v1
       # request 502s at the proxy.
       - SERVICE_URL_APPWRITE_80=/v1
       # Worker topology switch (Coolify shows this as an editable env var):
-      # combined (default) | separate | combined,mongodb | separate,embedding ...
+      # combined,timers (default) | separate,timers | combined (extra node,
+      # no timers) | separate,embedding ...
       # Referencing it here with a default makes Coolify persist it, so the
-      # combined worker/scheduler profile is active on a fresh deploy.
-      - 'COMPOSE_PROFILES=${COMPOSE_PROFILES:-combined}'
+      # default topology is active on a fresh deploy.
+      - 'COMPOSE_PROFILES=${COMPOSE_PROFILES:-combined,timers}'
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
       - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
@@ -178,10 +119,11 @@ services:
       - '_APP_ROUTER_AUTO_CERTIFICATES=${_APP_ROUTER_AUTO_CERTIFICATES:-}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
       - '_APP_NOTIFICATIONS_TRACKING_SECRET=${_APP_NOTIFICATIONS_TRACKING_SECRET:-$SERVICE_PASSWORD_64_NOTIFICATIONS}'
-      # Set _APP_DOMAIN explicitly when using a custom domain (see the
-      # deploy steps in the header); the default only suits Coolify's
-      # auto-generated domain.
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      # REQUIRED - Coolify shows a red border and blocks deploy until
+      # _APP_DOMAIN is set to your bare hostname, e.g. appwrite.example.com
+      # (no https://, no path, ONLY the hostname). _APP_DOMAIN_FUNCTIONS and
+      # _APP_DOMAIN_SITES derive from it automatically - see the header.
+      - '_APP_DOMAIN=${_APP_DOMAIN:?}'
       - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
       - _APP_CONSOLE_URL_SCHEME=root
       - '_APP_CONSOLE_TRUSTED_PROJECTS=${_APP_CONSOLE_TRUSTED_PROJECTS:-}'
@@ -190,7 +132,7 @@ services:
       - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
       - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
       - '_APP_DNS=${_APP_DNS:-}'
-      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
       - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
@@ -223,6 +165,7 @@ services:
       - '_APP_SMTP_PASSWORD=${_APP_SMTP_PASSWORD:-}'
       - '_APP_STORAGE_LIMIT=${_APP_STORAGE_LIMIT:-30000000}'
       - '_APP_STORAGE_PREVIEW_LIMIT=${_APP_STORAGE_PREVIEW_LIMIT:-20000000}'
+      - '_APP_AUTOGRAVITY_HOST=${_APP_AUTOGRAVITY_HOST:-http://appwrite-autogravity:8080}'
       - '_APP_STORAGE_ANTIVIRUS=${_APP_STORAGE_ANTIVIRUS:-disabled}'
       - '_APP_STORAGE_ANTIVIRUS_HOST=${_APP_STORAGE_ANTIVIRUS_HOST:-appwrite-clamav}'
       - '_APP_STORAGE_ANTIVIRUS_PORT=${_APP_STORAGE_ANTIVIRUS_PORT:-3310}'
@@ -256,9 +199,14 @@ services:
       - '_APP_COMPUTE_MEMORY=${_APP_COMPUTE_MEMORY:-0}'
       - '_APP_FUNCTIONS_RUNTIMES=${_APP_FUNCTIONS_RUNTIMES:-node-22}'
       - '_APP_SITES_RUNTIMES=${_APP_SITES_RUNTIMES:-static-1,node-22}'
-      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - '_APP_EXECUTOR_SECRET=${_APP_EXECUTOR_SECRET:-$SERVICE_PASSWORD_64_EXECUTOR}'
       - '_APP_EXECUTOR_HOST=${_APP_EXECUTOR_HOST:-http://openruntimes-executor/v1}'
+      # Volume the orchestrator attaches to build-job containers. Coolify
+      # renames every stack volume to "<stack-uuid>_<name>", so under Coolify
+      # set this env var to that prefixed name (find it with
+      # `docker volume ls | grep builds`). Wrong name = builds finish but
+      # deployments fail with "Build produced no output artifact".
       - '_APP_BUILDS_VOLUME=${_APP_BUILDS_VOLUME:-appwrite-builds}'
       - '_APP_JOBS_HOST=${_APP_JOBS_HOST:-http://orchestrator:8080}'
       - '_APP_JOBS_SECRET=${_APP_JOBS_SECRET:-$SERVICE_PASSWORD_64_JOBS}'
@@ -497,14 +445,14 @@ services:
       - _APP_CONSOLE_URL_SCHEME=root
       - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
       - '_APP_CONSOLE_TRUSTED_PROJECTS=${_APP_CONSOLE_TRUSTED_PROJECTS:-}'
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
       - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
       - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
       - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
       - '_APP_DNS=${_APP_DNS:-}'
-      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
-      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
       - '_APP_OPTIONS_ROUTER_FORCE_HTTPS=${_APP_OPTIONS_ROUTER_FORCE_HTTPS:-disabled}'
       - '_APP_WEBHOOK_MAX_FAILED_ATTEMPTS=${_APP_WEBHOOK_MAX_FAILED_ATTEMPTS:-10}'
@@ -559,6 +507,11 @@ services:
       - '_APP_VCS_ORIGIN_CLIENT_ID=${_APP_VCS_ORIGIN_CLIENT_ID:-}'
       - '_APP_VCS_ORIGIN_PRIVATE_KEY=${_APP_VCS_ORIGIN_PRIVATE_KEY:-}'
       - '_APP_VCS_WEBHOOK_URL=${_APP_VCS_WEBHOOK_URL:-http://appwrite/v1}'
+      # Volume the orchestrator attaches to build-job containers. Coolify
+      # renames every stack volume to "<stack-uuid>_<name>", so under Coolify
+      # set this env var to that prefixed name (find it with
+      # `docker volume ls | grep builds`). Wrong name = builds finish but
+      # deployments fail with "Build produced no output artifact".
       - '_APP_BUILDS_VOLUME=${_APP_BUILDS_VOLUME:-appwrite-builds}'
       - '_APP_JOBS_HOST=${_APP_JOBS_HOST:-http://orchestrator:8080}'
       - '_APP_JOBS_SECRET=${_APP_JOBS_SECRET:-$SERVICE_PASSWORD_64_JOBS}'
@@ -590,7 +543,7 @@ services:
     image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
     entrypoint: schedule
     profiles:
-      - combined
+      - timers
     restart: unless-stopped
     logging:
       driver: json-file
@@ -623,11 +576,11 @@ services:
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
       - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
       - '_APP_CONSOLE_SCHEMA=${_APP_CONSOLE_SCHEMA:-}'
-      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
-      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
       - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
@@ -1042,7 +995,7 @@ services:
       - '_APP_COMPUTE_SIZE_LIMIT=${_APP_COMPUTE_SIZE_LIMIT:-30000000}'
       - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
       - '_APP_OPTIONS_ROUTER_FORCE_HTTPS=${_APP_OPTIONS_ROUTER_FORCE_HTTPS:-disabled}'
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
       - _APP_CONSOLE_URL_SCHEME=root
       - '_APP_CONSOLE_TRUSTED_PROJECTS=${_APP_CONSOLE_TRUSTED_PROJECTS:-}'
@@ -1069,7 +1022,12 @@ services:
       - '_APP_STORAGE_WASABI_REGION=${_APP_STORAGE_WASABI_REGION:-eu-central-1}'
       - '_APP_STORAGE_WASABI_BUCKET=${_APP_STORAGE_WASABI_BUCKET:-}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
-      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
+      # Volume the orchestrator attaches to build-job containers. Coolify
+      # renames every stack volume to "<stack-uuid>_<name>", so under Coolify
+      # set this env var to that prefixed name (find it with
+      # `docker volume ls | grep builds`). Wrong name = builds finish but
+      # deployments fail with "Build produced no output artifact".
       - '_APP_BUILDS_VOLUME=${_APP_BUILDS_VOLUME:-appwrite-builds}'
       - '_APP_JOBS_HOST=${_APP_JOBS_HOST:-http://orchestrator:8080}'
       - '_APP_JOBS_SECRET=${_APP_JOBS_SECRET:-$SERVICE_PASSWORD_64_JOBS}'
@@ -1239,14 +1197,14 @@ services:
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
       - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
       - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
       - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
       - '_APP_DNS=${_APP_DNS:-}'
-      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
-      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - '_APP_EMAIL_CERTIFICATES=${_APP_EMAIL_CERTIFICATES:-certificates@appwrite.io}'
       - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
@@ -1332,7 +1290,7 @@ services:
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
       - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
@@ -1403,7 +1361,7 @@ services:
       - '_APP_SMTP_PASSWORD=${_APP_SMTP_PASSWORD:-}'
       - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
 
@@ -1450,7 +1408,7 @@ services:
       - '_APP_SMTP_PASSWORD=${_APP_SMTP_PASSWORD:-}'
       - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
 
@@ -1546,7 +1504,7 @@ services:
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
       - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
       - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
@@ -1591,6 +1549,8 @@ services:
   appwrite-task-maintenance:
     image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
     entrypoint: maintenance
+    profiles:
+      - timers
     container_name: appwrite-task-maintenance
     restart: unless-stopped
     logging:
@@ -1608,13 +1568,13 @@ services:
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
       - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
       - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
       - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
       - '_APP_DNS=${_APP_DNS:-}'
-      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
       - '_APP_EDITION=${_APP_EDITION:-self-hosted}'
       - '_APP_ROUTER_AUTO_CERTIFICATES=${_APP_ROUTER_AUTO_CERTIFICATES:-}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
@@ -1642,6 +1602,8 @@ services:
   appwrite-task-interval:
     image: '${_APP_IMAGE:-appwrite/appwrite}:${_APP_VERSION:-2.0.0}'
     entrypoint: interval
+    profiles:
+      - timers
     container_name: appwrite-task-interval
     restart: unless-stopped
     logging:
@@ -1659,14 +1621,14 @@ services:
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_DOMAIN_TARGET_CNAME=${_APP_DOMAIN_TARGET_CNAME:-localhost}'
       - '_APP_DOMAIN_TARGET_AAAA=${_APP_DOMAIN_TARGET_AAAA:-::1}'
       - '_APP_DOMAIN_TARGET_A=${_APP_DOMAIN_TARGET_A:-127.0.0.1}'
       - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
       - '_APP_DNS=${_APP_DNS:-}'
-      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
-      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
       - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
@@ -1707,10 +1669,10 @@ services:
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
       - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
-      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
-      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
       - '_APP_CONSOLE_SCHEMA=${_APP_CONSOLE_SCHEMA:-}'
       - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
@@ -1751,10 +1713,10 @@ services:
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
       - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
-      - '_APP_DOMAIN=${_APP_DOMAIN:-$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_CONSOLE_DOMAIN=${_APP_CONSOLE_DOMAIN:-}'
-      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.$SERVICE_FQDN_APPWRITE}'
-      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.$SERVICE_FQDN_APPWRITE}'
+      - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
+      - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
       - '_APP_CONSOLE_SCHEMA=${_APP_CONSOLE_SCHEMA:-}'
       - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
@@ -1806,12 +1768,18 @@ services:
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
 
   # --------------------------------------------------------------------------
-  # Assistant (Console AI - needs _APP_ASSISTANT_OPENAI_API_KEY)
+  # Assistant (Console AI) - OPTIONAL: behind the "assistant" profile.
+  # Without _APP_ASSISTANT_OPENAI_API_KEY the image exits with
+  # "OpenAI or Azure OpenAI API key not found" and restart-loops, so it is
+  # NOT started by default. Enable with COMPOSE_PROFILES=...,assistant AND
+  # set the key.
   # --------------------------------------------------------------------------
   appwrite-assistant:
     image: 'appwrite/assistant:0.8.4'
     container_name: appwrite-assistant
     restart: unless-stopped
+    profiles:
+      - assistant
     networks:
       - appwrite
     environment:
@@ -1821,6 +1789,17 @@ services:
   appwrite-browser:
     image: 'appwrite/browser:0.3.4'
     container_name: appwrite-browser
+    restart: unless-stopped
+    networks:
+      - appwrite
+
+  # Focal-point detection for image previews (smart cropping) - added
+  # upstream on main after the 2.0.0 tag. Consumed via _APP_AUTOGRAVITY_HOST
+  # by platform images newer than 2.0.0; on 2.0.0 it runs idle, no side
+  # effects. No config needed - the ONNX model ships in the image.
+  appwrite-autogravity:
+    image: 'ghcr.io/appwrite/autogravity:0.0.7'
+    container_name: appwrite-autogravity
     restart: unless-stopped
     networks:
       - appwrite
@@ -1935,7 +1914,7 @@ services:
   # Orchestrator - build jobs backend for functions/sites (needs docker.sock)
   # --------------------------------------------------------------------------
   orchestrator:
-    image: 'ghcr.io/open-runtimes/orchestrator/orchestrator:1.9.2'
+    image: 'ghcr.io/open-runtimes/orchestrator/orchestrator:2.1.0'
     container_name: orchestrator
     hostname: orchestrator
     restart: unless-stopped

@@ -66,11 +66,24 @@ No sticky sessions are needed: sessions live in PostgreSQL and realtime events f
 ## Part 0 — Prerequisites checklist
 
 - [ ] PostgreSQL, Redis, ClickHouse on their own servers, reachable from every future node over a **private network**
-- [ ] Firewall rules: database ports (5432, 6379, 8123) accept connections **only** from app nodes' private IPs
+- [ ] One-time SQL run on the external Postgres (see block below) — a plain server lacks both objects
+- [ ] ClickHouse HTTP interface verified: `curl http://<clickhouse-host>:8123/ping` returns `Ok.` — if it says *"Port 9000 is for clickhouse-client program"*, the port mapping is `8123:9000` and must be `8123:8123`
+- [ ] Firewall rules: database ports (5432, 6379, 8123 — or your custom ports, e.g. 5411 for Postgres) accept connections **only** from app nodes' private IPs
 - [ ] Storage device is S3/R2 (not Local) — all nodes must read/write the same files
 - [ ] SMTP configured
 - [ ] Node A deployed and healthy with `COMPOSE_PROFILES=combined,timers` (the default)
 - [ ] Backups running (Postgres + S3 versioning + offline secrets copy)
+
+**One-time SQL on the external Postgres.** The bundled template's postgres container does both of these automatically (`POSTGRES_DB` creates the database, and the `appwrite/postgres` image ships the collation pre-created); a plain external server does neither, and boot fails with `FATAL: database "appwrite" does not exist` or `ERROR: collation "utf8_ci_ai" for encoding "UTF8" does not exist`:
+
+```sql
+CREATE DATABASE appwrite;      -- name must match _APP_DB_SCHEMA
+\c appwrite
+CREATE COLLATION IF NOT EXISTS public.utf8_ci_ai (provider = icu,
+  locale = 'und-u-ks-level1', deterministic = false);
+```
+
+The collation definition is Appwrite's own, taken verbatim from the official `utopia-php/database` Postgres adapter (case-insensitive + accent-insensitive — required by Appwrite's unique indexes). The `public.` prefix is the only addition; it just names the target schema explicitly.
 
 ---
 

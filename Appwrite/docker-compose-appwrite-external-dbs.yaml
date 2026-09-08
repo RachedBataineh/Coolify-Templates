@@ -1,20 +1,37 @@
 # ==============================================================================
-# Appwrite 2.0 for Coolify - single-file Docker Compose template
+# Appwrite 2.0 for Coolify - EXTERNAL DATABASES variant
 # ==============================================================================
-# Coolify-ready packaging of the official Appwrite 2.0.0 compose file.
-# Full documentation (deploy guide, profiles, scaling, troubleshooting):
-#   -> README.md
+# Same platform as docker-compose-appwrite-coolify-2.0.0.yaml, but WITHOUT the
+# local PostgreSQL, Redis, ClickHouse and MongoDB services. Point Appwrite at
+# your own database servers (e.g. on a Hetzner private network) - this is the
+# production-split / multi-node prerequisite.
 #
-# QUICK START
-#   1. Paste this file into a Coolify Docker Compose resource -> Deploy.
-#   2. Same hostname on all three routed services, keeping paths:
-#      Appwrite /v1 | Console / | Realtime /v1/realtime
-#   3. Env tab: _APP_DOMAIN=your.hostname  (required - deploy is blocked
-#      until set)
-#   4. Appwrite + Realtime services: Advanced -> Path prefixes ->
-#      "Keep prefixes"
-#   5. Deploy, register the first user (becomes admin).
-#   Then see README.md: server prep, builds volume, sites domains, SMTP.
+# REQUIRED env vars (Coolify blocks deploy until set - red border):
+#   _APP_DOMAIN=your.hostname
+#   _APP_DB_HOST=<postgres private IP or hostname>
+#   _APP_REDIS_HOST=<redis private IP or hostname>
+#   _APP_CLICKHOUSE_HOST=<clickhouse private IP or hostname>
+# AND your external credentials:
+#   _APP_DB_USER=...  /  _APP_DB_PASS=...
+#   _APP_USAGE_PASS=<external clickhouse password>
+#   _APP_REDIS_USER / _APP_REDIS_PASS (strongly recommended: traffic now
+#   crosses a network - an exposed passwordless Redis is compromised in hours)
+#
+# ONE-TIME SETUP on your external Postgres (the bundled template's postgres
+# container does this automatically via POSTGRES_DB; a bare server does not):
+#   CREATE DATABASE appwrite;      -- name must match _APP_DB_SCHEMA
+#   \c appwrite
+#   CREATE COLLATION IF NOT EXISTS public.utf8_ci_ai (provider = icu,
+#     locale = 'und-u-ks-level1', deterministic = false);
+#   -- Appwrite's SQL uses this case/accent-insensitive collation on unique
+#   -- indexes; the appwrite/postgres image ships it pre-created, a plain
+#   -- postgres server does not. Without it, boot fails with:
+#   -- ERROR: collation "utf8_ci_ai" for encoding "UTF8" does not exist
+#
+# Everything else (domains/paths, Keep prefixes, COMPOSE_PROFILES, scaling,
+# builds volume) matches the main template - see README.md and
+# GUIDE-horizontal-scaling.md. With S3 storage the _APP_BUILDS_VOLUME fix
+# is not needed (builds upload to the bucket instead).
 # ==============================================================================
 x-logging:
   logging:
@@ -58,9 +75,8 @@ services:
       - appwrite-sites:/storage/sites:rw
       - appwrite-builds:/storage/builds:rw
     depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
       - appwrite-geo
+      - appwrite-autogravity
     environment:
       # The _80 suffix pins the Traefik backend port explicitly; without it
       # Coolify's port auto-detection can pick a wrong port and every /v1
@@ -74,11 +90,11 @@ services:
       - 'COMPOSE_PROFILES=${COMPOSE_PROFILES:-combined,timers}'
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
-      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
-      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:?}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_POOL_SIZE_USAGE=${_APP_POOL_SIZE_USAGE:-2}'
       - '_APP_EXECUTIONS_DUAL_WRITE=${_APP_EXECUTIONS_DUAL_WRITE:-enabled}'
-      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_POOL_SIZE_EXECUTIONS=${_APP_POOL_SIZE_EXECUTIONS:-2}'
       - '_APP_MAINTENANCE_RETENTION_USAGE_TTL=${_APP_MAINTENANCE_RETENTION_USAGE_TTL:-180}'
       - '_APP_STATS_USAGE_QUEUE_NAME=${_APP_STATS_USAGE_QUEUE_NAME:-v1-stats-usage}'
@@ -132,17 +148,19 @@ services:
       - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
       - '_APP_DNS=${_APP_DNS:-}'
       - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
+      - '_APP_CLICKHOUSE_HOST=${_APP_CLICKHOUSE_HOST:?}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
-      - '_APP_DB_ROOT_PASS=${_APP_DB_ROOT_PASS:-$SERVICE_PASSWORD_64_MONGODBROOT}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
+      - '_APP_DB_ROOT_PASS=${_APP_DB_ROOT_PASS:-}'
       - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
       - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
       - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
@@ -164,6 +182,7 @@ services:
       - '_APP_SMTP_PASSWORD=${_APP_SMTP_PASSWORD:-}'
       - '_APP_STORAGE_LIMIT=${_APP_STORAGE_LIMIT:-30000000}'
       - '_APP_STORAGE_PREVIEW_LIMIT=${_APP_STORAGE_PREVIEW_LIMIT:-20000000}'
+      - '_APP_AUTOGRAVITY_HOST=${_APP_AUTOGRAVITY_HOST:-http://appwrite-autogravity:8080}'
       - '_APP_STORAGE_ANTIVIRUS=${_APP_STORAGE_ANTIVIRUS:-disabled}'
       - '_APP_STORAGE_ANTIVIRUS_HOST=${_APP_STORAGE_ANTIVIRUS_HOST:-appwrite-clamav}'
       - '_APP_STORAGE_ANTIVIRUS_PORT=${_APP_STORAGE_ANTIVIRUS_PORT:-3310}'
@@ -307,9 +326,6 @@ services:
       nofile:
         soft: 65536
         hard: 65536
-    depends_on:
-      - '${_APP_DB_HOST:-postgresql}'
-      - redis
     environment:
       # Port-less on purpose: declaring the same port-suffixed variable on
       # two services with different paths makes Coolify merge their routers.
@@ -324,16 +340,16 @@ services:
       - '_APP_CONSOLE_HOSTNAMES=${_APP_CONSOLE_HOSTNAMES:-}'
       - '_APP_REALTIME_TAIL_RATE=${_APP_REALTIME_TAIL_RATE:-50}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
       - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
       - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
@@ -376,9 +392,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     volumes:
       - appwrite-uploads:/storage/uploads:rw
       - appwrite-cache:/storage/cache:rw
@@ -393,11 +406,11 @@ services:
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
-      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
-      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_POOL_SIZE_USAGE=${_APP_POOL_SIZE_USAGE:-2}'
       - '_APP_EXECUTIONS_DUAL_WRITE=${_APP_EXECUTIONS_DUAL_WRITE:-enabled}'
-      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_POOL_SIZE_EXECUTIONS=${_APP_POOL_SIZE_EXECUTIONS:-2}'
       - '_APP_MAINTENANCE_RETENTION_USAGE_TTL=${_APP_MAINTENANCE_RETENTION_USAGE_TTL:-180}'
       - '_APP_STATS_USAGE_QUEUE_NAME=${_APP_STATS_USAGE_QUEUE_NAME:-v1-stats-usage}'
@@ -412,11 +425,11 @@ services:
       - '_APP_EMAIL_SECURITY=${_APP_EMAIL_SECURITY:-security@appwrite.io}'
       - '_APP_EMAIL_CERTIFICATES=${_APP_EMAIL_CERTIFICATES:-certificates@appwrite.io}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
       - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
       - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
@@ -431,7 +444,7 @@ services:
       - '_APP_DB_PASS_DOCUMENTSDB=${_APP_DB_PASS_DOCUMENTSDB:-}'
       - '_APP_CONNECTIONS_DATABASE_DOCUMENTSDB=${_APP_CONNECTIONS_DATABASE_DOCUMENTSDB:-}'
       - '_APP_CONNECTIONS_DATABASE_VECTORSDB=${_APP_CONNECTIONS_DATABASE_VECTORSDB:-}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
@@ -550,17 +563,14 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - '${_APP_DB_HOST:-postgresql}'
-      - redis
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
-      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
-      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_POOL_SIZE_USAGE=${_APP_POOL_SIZE_USAGE:-2}'
       - '_APP_EXECUTIONS_DUAL_WRITE=${_APP_EXECUTIONS_DUAL_WRITE:-enabled}'
-      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_POOL_SIZE_EXECUTIONS=${_APP_POOL_SIZE_EXECUTIONS:-2}'
       - '_APP_MAINTENANCE_RETENTION_USAGE_TTL=${_APP_MAINTENANCE_RETENTION_USAGE_TTL:-180}'
       - '_APP_STATS_USAGE_QUEUE_NAME=${_APP_STATS_USAGE_QUEUE_NAME:-v1-stats-usage}'
@@ -580,16 +590,16 @@ services:
       - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
       - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
       - '_APP_FUNCTIONS_SCHEDULE_SPREAD=${_APP_FUNCTIONS_SCHEDULE_SPREAD:-}'
 
@@ -612,15 +622,12 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
       - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
-      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
-      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_POOL_SIZE_USAGE=${_APP_POOL_SIZE_USAGE:-2}'
       - '_APP_STATS_USAGE_QUEUE_NAME=${_APP_STATS_USAGE_QUEUE_NAME:-v1-stats-usage}'
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
@@ -628,16 +635,16 @@ services:
       - _APP_WORKERS_NUM=1
       # Pool sizing mirrors the combined worker.
       - _APP_WORKER_MAX_COROUTINES=78
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
@@ -657,15 +664,12 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
       - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
-      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
-      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_STATS_RESOURCES_QUEUE_NAME=${_APP_STATS_RESOURCES_QUEUE_NAME:-v1-stats-resources}'
       - '_APP_STATS_RESOURCES_INTERVAL=${_APP_STATS_RESOURCES_INTERVAL:-3600}'
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
@@ -673,16 +677,16 @@ services:
       - _APP_WORKERS_NUM=1
       # Pool sizing mirrors the combined worker.
       - _APP_WORKER_MAX_COROUTINES=78
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
@@ -702,9 +706,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - '${_APP_DB_HOST:-postgresql}'
-      - redis
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
@@ -716,16 +717,16 @@ services:
       - '_APP_STATS_RESOURCES_INTERVAL=${_APP_STATS_RESOURCES_INTERVAL:-3600}'
       # Pool sizing mirrors the combined scheduler.
       - _APP_WORKER_MAX_COROUTINES=8
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
 
   appwrite-worker-webhooks:
@@ -743,9 +744,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -755,12 +753,12 @@ services:
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
       - '_APP_EMAIL_SECURITY=${_APP_EMAIL_SECURITY:-security@appwrite.io}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
@@ -785,9 +783,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     volumes:
       - appwrite-uploads:/storage/uploads:rw
       - appwrite-cache:/storage/cache:rw
@@ -797,10 +792,10 @@ services:
       - appwrite-certificates:/storage/certificates:rw
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
-      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
-      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_EXECUTIONS_DUAL_WRITE=${_APP_EXECUTIONS_DUAL_WRITE:-enabled}'
-      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_POOL_SIZE_EXECUTIONS=${_APP_POOL_SIZE_EXECUTIONS:-2}'
       - '_APP_MAINTENANCE_RETENTION_EXECUTION=${_APP_MAINTENANCE_RETENTION_EXECUTION:-1209600}'
       - _APP_WORKERS_NUM=1
@@ -808,16 +803,16 @@ services:
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
       - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
       - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
@@ -878,9 +873,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -888,16 +880,16 @@ services:
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
       - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
       - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
@@ -940,9 +932,6 @@ services:
       - appwrite-functions:/storage/functions:rw
       - appwrite-sites:/storage/sites:rw
       - appwrite-builds:/storage/builds:rw
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     extra_hosts:
       - host.docker.internal:host-gateway
     environment:
@@ -954,16 +943,16 @@ services:
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
       - '_APP_EXECUTOR_SECRET=${_APP_EXECUTOR_SECRET:-$SERVICE_PASSWORD_64_EXECUTOR}'
       - '_APP_EXECUTOR_HOST=${_APP_EXECUTOR_HOST:-http://openruntimes-executor/v1}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - '_APP_VCS_GITHUB_APP_NAME=${_APP_VCS_GITHUB_APP_NAME:-}'
@@ -1048,9 +1037,6 @@ services:
       - appwrite
     volumes:
       - appwrite-builds:/storage/builds:rw
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     extra_hosts:
       - host.docker.internal:host-gateway
     environment:
@@ -1084,16 +1070,16 @@ services:
       - '_APP_STORAGE_WASABI_BUCKET=${_APP_STORAGE_WASABI_BUCKET:-}'
       - '_APP_JOBS_HOST=${_APP_JOBS_HOST:-http://orchestrator:8080}'
       - '_APP_JOBS_SECRET=${_APP_JOBS_SECRET:-$SERVICE_PASSWORD_64_JOBS}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
@@ -1115,9 +1101,6 @@ services:
       - appwrite
     volumes:
       - appwrite-uploads:/storage/uploads:rw
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     environment:
       - '_APP_BROWSER_HOST=${_APP_BROWSER_HOST:-http://appwrite-browser:3000/v1}'
       - '_APP_SITES_TIMEOUT=${_APP_SITES_TIMEOUT:-60}'
@@ -1131,16 +1114,16 @@ services:
       - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
       - '_APP_STORAGE_DEVICE=${_APP_STORAGE_DEVICE:-Local}'
       - '_APP_STORAGE_S3_ACCESS_KEY=${_APP_STORAGE_S3_ACCESS_KEY:-}'
@@ -1182,9 +1165,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     volumes:
       - appwrite-config:/storage/config:rw
       - appwrite-certificates:/storage/certificates:rw
@@ -1204,16 +1184,16 @@ services:
       - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
       - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - '_APP_EMAIL_CERTIFICATES=${_APP_EMAIL_CERTIFICATES:-certificates@appwrite.io}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
@@ -1233,15 +1213,12 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
-      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}'
-      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-}'
+      - '_APP_CONNECTIONS_DB_USAGE=${_APP_CONNECTIONS_DB_USAGE:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_EXECUTIONS_DUAL_WRITE=${_APP_EXECUTIONS_DUAL_WRITE:-enabled}'
-      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}@clickhouse:8123/appwrite}'
+      - '_APP_CONNECTIONS_DB_EXECUTIONS=${_APP_CONNECTIONS_DB_EXECUTIONS:-http://appwrite:${_APP_USAGE_PASS}@${_APP_CLICKHOUSE_HOST}:${_APP_CLICKHOUSE_PORT:-8123}/appwrite}'
       - '_APP_POOL_SIZE_EXECUTIONS=${_APP_POOL_SIZE_EXECUTIONS:-2}'
       - '_APP_MAINTENANCE_RETENTION_EXECUTION=${_APP_MAINTENANCE_RETENTION_EXECUTION:-1209600}'
       - _APP_WORKERS_NUM=1
@@ -1249,16 +1226,16 @@ services:
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
@@ -1278,9 +1255,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - '${_APP_DB_HOST:-postgresql}'
-      - redis
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1290,16 +1264,16 @@ services:
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
       - '_APP_DOMAIN=${_APP_DOMAIN}'
       - '_APP_OPTIONS_FORCE_HTTPS=${_APP_OPTIONS_FORCE_HTTPS:-disabled}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_FUNCTIONS_TIMEOUT=${_APP_FUNCTIONS_TIMEOUT:-900}'
       - '_APP_SITES_TIMEOUT=${_APP_SITES_TIMEOUT:-60}'
       - '_APP_COMPUTE_BUILD_TIMEOUT=${_APP_COMPUTE_BUILD_TIMEOUT:-900}'
@@ -1329,9 +1303,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1342,15 +1313,15 @@ services:
       - '_APP_NOTIFICATIONS_TRACKING_SECRET=${_APP_NOTIFICATIONS_TRACKING_SECRET:-$SERVICE_PASSWORD_64_NOTIFICATIONS}'
       - '_APP_SYSTEM_EMAIL_NAME=${_APP_SYSTEM_EMAIL_NAME:-Appwrite}'
       - '_APP_SYSTEM_EMAIL_ADDRESS=${_APP_SYSTEM_EMAIL_ADDRESS:-noreply@appwrite.io}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
       - '_APP_SMTP_HOST=${_APP_SMTP_HOST:-}'
       - '_APP_SMTP_PORT=${_APP_SMTP_PORT:-}'
@@ -1378,9 +1349,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - redis
-      - '${_APP_DB_HOST:-postgresql}'
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
@@ -1389,15 +1357,15 @@ services:
       - '_APP_NOTIFICATIONS_TRACKING_SECRET=${_APP_NOTIFICATIONS_TRACKING_SECRET:-$SERVICE_PASSWORD_64_NOTIFICATIONS}'
       - '_APP_SYSTEM_EMAIL_NAME=${_APP_SYSTEM_EMAIL_NAME:-Appwrite}'
       - '_APP_SYSTEM_EMAIL_ADDRESS=${_APP_SYSTEM_EMAIL_ADDRESS:-noreply@appwrite.io}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
       - '_APP_SMTP_HOST=${_APP_SMTP_HOST:-}'
       - '_APP_SMTP_PORT=${_APP_SMTP_PORT:-}'
@@ -1427,8 +1395,6 @@ services:
       - appwrite
     volumes:
       - appwrite-uploads:/storage/uploads:rw
-    depends_on:
-      - redis
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1436,16 +1402,16 @@ services:
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_LOGGING_CONFIG=${_APP_LOGGING_CONFIG:-}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - '_APP_SMS_FROM=${_APP_SMS_FROM:-}'
@@ -1493,8 +1459,6 @@ services:
     volumes:
       - appwrite-imports:/storage/imports:rw
       - appwrite-uploads:/storage/uploads:rw
-    depends_on:
-      - '${_APP_DB_HOST:-postgresql}'
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1509,16 +1473,16 @@ services:
       - '_APP_DOMAIN_TARGET_CAA=${_APP_DOMAIN_TARGET_CAA:-}'
       - '_APP_DNS=${_APP_DNS:-}'
       - '_APP_EMAIL_SECURITY=${_APP_EMAIL_SECURITY:-security@appwrite.io}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DB_ADAPTER_VECTORSDB=${_APP_DB_ADAPTER_VECTORSDB:-postgresql}'
       - '_APP_DB_HOST_VECTORSDB=${_APP_DB_HOST_VECTORSDB:-postgresql}'
       - '_APP_DB_PORT_VECTORSDB=${_APP_DB_PORT_VECTORSDB:-5432}'
@@ -1558,9 +1522,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - '${_APP_DB_HOST:-postgresql}'
-      - redis
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
@@ -1576,16 +1537,16 @@ services:
       - '_APP_EDITION=${_APP_EDITION:-self-hosted}'
       - '_APP_ROUTER_AUTO_CERTIFICATES=${_APP_ROUTER_AUTO_CERTIFICATES:-}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_MAINTENANCE_INTERVAL=${_APP_MAINTENANCE_INTERVAL:-86400}'
       - '_APP_MAINTENANCE_RETENTION_EXECUTION=${_APP_MAINTENANCE_RETENTION_EXECUTION:-1209600}'
       - '_APP_MAINTENANCE_RETENTION_CACHE=${_APP_MAINTENANCE_RETENTION_CACHE:-2592000}'
@@ -1611,9 +1572,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - '${_APP_DB_HOST:-postgresql}'
-      - redis
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
@@ -1628,16 +1586,16 @@ services:
       - '_APP_DOMAIN_FUNCTIONS=${_APP_DOMAIN_FUNCTIONS:-functions.${_APP_DOMAIN}}'
       - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
       - '_APP_INTERVAL_DOMAIN_VERIFICATION=${_APP_INTERVAL_DOMAIN_VERIFICATION:-120}'
       - '_APP_INTERVAL_CLEANUP_STALE_EXECUTIONS=${_APP_INTERVAL_CLEANUP_STALE_EXECUTIONS:-300}'
@@ -1657,9 +1615,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - '${_APP_DB_HOST:-postgresql}'
-      - redis
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
@@ -1673,16 +1628,16 @@ services:
       - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
       - '_APP_CONSOLE_SCHEMA=${_APP_CONSOLE_SCHEMA:-}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
       - '_APP_FUNCTIONS_SCHEDULE_SPREAD=${_APP_FUNCTIONS_SCHEDULE_SPREAD:-}'
 
@@ -1701,9 +1656,6 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - '${_APP_DB_HOST:-postgresql}'
-      - redis
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
@@ -1717,16 +1669,16 @@ services:
       - '_APP_DOMAIN_SITES=${_APP_DOMAIN_SITES:-sites.${_APP_DOMAIN}}'
       - '_APP_MIGRATION_HOST=${_APP_MIGRATION_HOST:-appwrite}'
       - '_APP_CONSOLE_SCHEMA=${_APP_CONSOLE_SCHEMA:-}'
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
 
   appwrite-task-scheduler-messages:
@@ -1744,34 +1696,37 @@ services:
         max-size: 10m
     networks:
       - appwrite
-    depends_on:
-      - '${_APP_DB_HOST:-postgresql}'
-      - redis
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
       - '_APP_POOL_ADAPTER=${_APP_POOL_ADAPTER:-stack}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
-      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:-redis}'
+      - '_APP_REDIS_HOST=${_APP_REDIS_HOST:?}'
       - '_APP_REDIS_PORT=${_APP_REDIS_PORT:-6379}'
       - '_APP_REDIS_USER=${_APP_REDIS_USER:-}'
       - '_APP_REDIS_PASS=${_APP_REDIS_PASS:-}'
       - '_APP_DB_ADAPTER=${_APP_DB_ADAPTER:-postgresql}'
-      - '_APP_DB_HOST=${_APP_DB_HOST:-postgresql}'
+      - '_APP_DB_HOST=${_APP_DB_HOST:?}'
       - '_APP_DB_PORT=${_APP_DB_PORT:-5432}'
       - '_APP_DB_SCHEMA=${_APP_DB_SCHEMA:-appwrite}'
-      - '_APP_DB_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}'
-      - '_APP_DB_PASS=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}'
+      - '_APP_DB_USER=${_APP_DB_USER:-}'
+      - '_APP_DB_PASS=${_APP_DB_PASS:-}'
       - '_APP_DATABASE_SHARED_TABLES=${_APP_DATABASE_SHARED_TABLES:-}'
 
   # --------------------------------------------------------------------------
-  # Assistant (Console AI - needs _APP_ASSISTANT_OPENAI_API_KEY)
+  # Assistant (Console AI) - OPTIONAL: behind the "assistant" profile.
+  # Without _APP_ASSISTANT_OPENAI_API_KEY the image exits with
+  # "OpenAI or Azure OpenAI API key not found" and restart-loops, so it is
+  # NOT started by default. Enable with COMPOSE_PROFILES=...,assistant AND
+  # set the key.
   # --------------------------------------------------------------------------
   appwrite-assistant:
     image: 'appwrite/assistant:0.8.4'
     container_name: appwrite-assistant
     restart: unless-stopped
+    profiles:
+      - assistant
     networks:
       - appwrite
     environment:
@@ -1785,42 +1740,19 @@ services:
     networks:
       - appwrite
 
-  # --------------------------------------------------------------------------
-  # ClickHouse - usage stats + optional execution logs dual-write
-  # --------------------------------------------------------------------------
-  clickhouse:
-    image: 'clickhouse/clickhouse-server:26.4.3-alpine'
-    container_name: appwrite-clickhouse
+  # Focal-point detection for image previews (smart cropping) - added
+  # upstream on main after the 2.0.0 tag. Consumed via _APP_AUTOGRAVITY_HOST
+  # by platform images newer than 2.0.0; on 2.0.0 it runs idle, no side
+  # effects. No config needed - the ONNX model ships in the image.
+  appwrite-autogravity:
+    image: 'ghcr.io/appwrite/autogravity:0.0.7'
+    container_name: appwrite-autogravity
     restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-file: "5"
-        max-size: 10m
     networks:
       - appwrite
-    environment:
-      - CLICKHOUSE_DB=appwrite
-      - CLICKHOUSE_USER=appwrite
-      - CLICKHOUSE_PASSWORD=${_APP_USAGE_PASS:-$SERVICE_PASSWORD_CLICKHOUSE}
-      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
-    volumes:
-      - appwrite-clickhouse:/var/lib/clickhouse:rw
-    ulimits:
-      nofile:
-        soft: 262144
-        hard: 262144
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - 'clickhouse-client --user "$$CLICKHOUSE_USER" --password "$$CLICKHOUSE_PASSWORD" --query "SELECT 1" >/dev/null'
-      interval: 5s
-      timeout: 5s
-      retries: 20
-      start_period: 30s
 
   # --------------------------------------------------------------------------
-  # Geo service (IP geolocation)
+  # ClickHouse - usage stats + optional execution logs dual-write
   # --------------------------------------------------------------------------
   appwrite-geo:
     image: 'appwrite/geo:0.3.1'
@@ -1895,7 +1827,7 @@ services:
   # Orchestrator - build jobs backend for functions/sites (needs docker.sock)
   # --------------------------------------------------------------------------
   orchestrator:
-    image: 'ghcr.io/open-runtimes/orchestrator/orchestrator:1.9.2'
+    image: 'ghcr.io/open-runtimes/orchestrator/orchestrator:2.1.0'
     container_name: orchestrator
     hostname: orchestrator
     restart: unless-stopped
@@ -1924,91 +1856,6 @@ services:
   # --------------------------------------------------------------------------
   # Databases
   # --------------------------------------------------------------------------
-  postgresql:
-    image: 'appwrite/postgres:0.1.0'
-    container_name: appwrite-postgresql
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-file: "5"
-        max-size: 10m
-    networks:
-      - appwrite
-    volumes:
-      - appwrite-postgresql:/var/lib/postgresql:rw
-    environment:
-      - POSTGRES_DB=${_APP_DB_SCHEMA:-appwrite}
-      - POSTGRES_USER=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}
-      - POSTGRES_PASSWORD=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - pg_isready -U ${_APP_DB_USER:-$SERVICE_USER_POSTGRES} -d ${_APP_DB_SCHEMA:-appwrite}
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-    command:
-      - postgres
-
-  # MongoDB for DocumentsDB (profile `mongodb` + _APP_DOCUMENTSDB=enabled)
-  mongodb:
-    image: 'mongo:8.2.5'
-    container_name: appwrite-mongodb
-    profiles:
-      - mongodb
-    exclude_from_hc: true
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-file: "5"
-        max-size: 10m
-    networks:
-      - appwrite
-    volumes:
-      - appwrite-mongodb:/data/db
-      - appwrite-mongodb-keyfile:/data/keyfile
-    configs:
-      - source: mongo-init-js
-        target: /docker-entrypoint-initdb.d/mongo-init.js
-      - source: mongo-entrypoint-sh
-        target: /mongo-entrypoint.sh
-        mode: 0755
-    environment:
-      - MONGO_INITDB_ROOT_USERNAME=root
-      - MONGO_INITDB_ROOT_PASSWORD=${_APP_DB_ROOT_PASS:-$SERVICE_PASSWORD_64_MONGODBROOT}
-      - MONGO_INITDB_DATABASE=${_APP_DB_SCHEMA:-appwrite}
-      - MONGO_INITDB_USERNAME=${_APP_DB_USER:-$SERVICE_USER_POSTGRES}
-      - MONGO_INITDB_PASSWORD=${_APP_DB_PASS:-$SERVICE_PASSWORD_POSTGRES}
-    entrypoint:
-      - /bin/bash
-      - /mongo-entrypoint.sh
-    healthcheck:
-      test: |
-        bash -c "
-          mongosh -u root -p ${_APP_DB_ROOT_PASS:-$SERVICE_PASSWORD_64_MONGODBROOT} --authenticationDatabase admin --quiet --eval \"
-            try {
-              const hello = db.adminCommand({hello: 1});
-              if (hello.isWritablePrimary && hello.setName === 'rs0') {
-                quit(0);
-              }
-            } catch (e) {}
-
-            try {
-              rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongodb:27017'}]});
-            } catch (e) {}
-
-            quit(1);
-          \" 2>/dev/null
-        "
-      interval: 10s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
-
-  # Local embeddings model server (profile `embedding` + _APP_EMBEDDING=enabled)
   appwrite-embedding:
     image: 'appwrite/embedding:0.3.1'
     container_name: appwrite-embedding
@@ -2023,42 +1870,6 @@ services:
     networks:
       - appwrite
 
-  redis:
-    image: 'redis:7.4.7-alpine'
-    container_name: appwrite-redis
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-file: "5"
-        max-size: 10m
-    command:
-      - redis-server
-      - --maxmemory
-      - 512mb
-      - --maxmemory-policy
-      - allkeys-lru
-      - --maxmemory-samples
-      - "5"
-    networks:
-      - appwrite
-    volumes:
-      - appwrite-redis:/data:rw
-    healthcheck:
-      test:
-        - CMD
-        - redis-cli
-        - ping
-      interval: 5s
-      timeout: 5s
-      retries: 12
-
-# ------------------------------------------------------------------------------
-# Networks - pinned names. Function/site runtime containers spawned by the
-# executor join `runtimes`; build workers spawned by the orchestrator join
-# `appwrite`; both are created by this stack so names must stay stable.
-# Coolify's proxy is attached automatically to the `appwrite` network.
-# ------------------------------------------------------------------------------
 networks:
   appwrite:
     name: appwrite
@@ -2071,12 +1882,7 @@ networks:
 # (see _APP_BUILDS_VOLUME).
 # ------------------------------------------------------------------------------
 volumes:
-  appwrite-postgresql:
-  appwrite-mongodb:
-  appwrite-mongodb-keyfile:
-  appwrite-redis:
   appwrite-cache:
-  appwrite-clickhouse:
   appwrite-uploads:
   appwrite-imports:
   appwrite-certificates:
@@ -2088,45 +1894,3 @@ volumes:
   appwrite-models:
 
 # Mongo helper files (inline so this stays a single-file Coolify template)
-configs:
-  mongo-init-js:
-    content: |
-      // mongo-init.js
-
-      // Switch to the admin database
-      const adminDb = db.getSiblingDB('admin');
-
-      // Get username and password from environment variables
-      const username = process.env.MONGO_INITDB_USERNAME;
-      const password = process.env.MONGO_INITDB_PASSWORD;
-      const database = process.env.MONGO_INITDB_DATABASE;
-
-      // Create the user
-      adminDb.createUser({
-        user: username,
-        pwd: password,
-        roles: [
-          { role: 'readWrite', db: database }
-        ]
-      });
-  mongo-entrypoint-sh:
-    # NOTE: '$$' is escaped on purpose - compose must not interpolate the
-    # shell variables; the container receives a literal '$KEYFILE_PATH'.
-    content: |
-      #!/bin/bash
-      set -e
-
-      # Fix keyfile permissions if mounted from volume
-      KEYFILE_PATH="/data/keyfile/mongo-keyfile"
-
-      if [ ! -f "$$KEYFILE_PATH" ]; then
-        echo "Generating random MongoDB keyfile..."
-        mkdir -p /data/keyfile
-        openssl rand -base64 756 > "$$KEYFILE_PATH"
-      fi
-
-      chmod 400 "$$KEYFILE_PATH"
-      chown mongodb:mongodb "$$KEYFILE_PATH" 2>/dev/null || chown 999:999 "$$KEYFILE_PATH"
-
-      # Use MongoDB's standard entrypoint with our command
-      exec docker-entrypoint.sh mongod --replSet rs0 --bind_ip_all --auth --keyFile "$$KEYFILE_PATH"

@@ -2,6 +2,13 @@
 
 A single-file Docker Compose template that runs [Appwrite](https://appwrite.io) 2.0 on [Coolify](https://coolify.io) — adapted from the official [Appwrite 2.0.0 compose file](https://github.com/appwrite/appwrite/blob/2.0.0/docker-compose.yml) and hardened through real-world deployment and debugging.
 
+## Two files in this repo
+
+| File | Use it when |
+|---|---|
+| `docker-compose-appwrite-coolify-2.0.0.yaml` | **Default** — everything on one server (databases included) |
+| `docker-compose-appwrite-coolify-2.0.0-external-dbs.yaml` | **Production split** — no local PostgreSQL/Redis/ClickHouse/MongoDB; you point Appwrite at your own database servers (private network). Required env vars: `_APP_DOMAIN`, `_APP_DB_HOST`, `_APP_REDIS_HOST`, `_APP_CLICKHOUSE_HOST`, `_APP_USAGE_PASS`, plus your DB credentials (`_APP_DB_USER`, `_APP_DB_PASS`, `_APP_REDIS_USER`/`_APP_REDIS_PASS`). One-time on the Postgres server: `CREATE DATABASE appwrite;` (must match `_APP_DB_SCHEMA` — the bundled template's postgres container creates it automatically, an external server won't), then connected to that database `CREATE COLLATION IF NOT EXISTS public.utf8_ci_ai (provider = icu, locale = 'und-u-ks-level1', deterministic = false);` — Appwrite's SQL requires this collation, which the bundled `appwrite/postgres` image ships pre-created but a plain server lacks. Everything else in this README applies to both files. |
+
 ## What you get
 
 - **Full Appwrite 2.0 platform** — Console IV, API, realtime, functions, sites, auth, storage
@@ -104,12 +111,13 @@ Set the `COMPOSE_PROFILES` env var in Coolify:
 | `separate` | 19 dedicated workers/schedulers for per-queue scaling |
 | `mongodb` | Adds MongoDB for DocumentsDB (also set `_APP_DOCUMENTSDB=enabled`) |
 | `embedding` | Adds the local embeddings server (also set `_APP_EMBEDDING=enabled`) |
+| `assistant` | Console AI assistant (also set `_APP_ASSISTANT_OPENAI_API_KEY`, otherwise it exits with "OpenAI API key not found" and restart-loops) |
 
 - Single-node default: `COMPOSE_PROFILES=combined,timers`
 - Per-queue scaling on one node: `COMPOSE_PROFILES=separate,timers`
 - Combine freely with the optional services: `separate,timers,mongodb`
 
-`separate` automatically disables the combined worker — queues and timers are never processed twice. Parked profile services carry `exclude_from_hc: true` so the stack status badge ignores them (the timers intentionally do *not* carry it — they must be monitored wherever they run). Remove that flag on any optional service you activate.
+`separate` automatically disables the combined worker — queues and timers are never processed twice. This mirrors Appwrite's official worker-topologies doctrine: combined is the recommended default, and running both topologies at once is explicitly unsupported because jobs race between consumers ([official announcement](https://appwrite.io/blog/post/announcing-worker-topologies) · [topologies docs](https://appwrite.io/docs/advanced/self-hosting/configuration/topologies)). The `timers` split on top of it is this template's addition for multi-node scaling (see the guide). Parked profile services carry `exclude_from_hc: true` so the stack status badge ignores them (the timers intentionally do *not* carry it — they must be monitored wherever they run). Remove that flag on any optional service you activate.
 
 ## Multi-node horizontal scaling
 
@@ -186,6 +194,11 @@ Every entry below was hit and verified in a real deployment.
 | Creating a site fails: `Invalid domain param: Value must be a valid domain` | Sites domain polluted with a path (e.g. `/v1/realtime`) — derived from a routing-artifact variable | Keep `_APP_DOMAIN` a bare hostname; `_APP_DOMAIN_SITES` derives cleanly from it |
 | Site URL fails TLS handshake at Cloudflare | Wildcard cert only covers one level; `*.sites.x.y.z` is two levels | Option A (Advanced Certificate) or Option B (one-level custom domain) |
 | Redis warning: `Memory overcommit must be enabled` | Kernel setting (host-level) | Server prep command above, then restart Redis |
+| Every service logs `Connection refused` to a DB host (external-DB variant) | Database server unreachable: port not published, bound to localhost, or firewalled | Publish the port on the DB stack (`<port>:<port>`), verify from the app server with `nc -zv <host> <port>` |
+| Boot fails: `FATAL: database "appwrite" does not exist` (external-DB variant) | Plain external Postgres has no `appwrite` database — the bundled image creates it via `POSTGRES_DB` | `CREATE DATABASE appwrite;` on the external server (prerequisites block in the file header) |
+| Boot fails: `ERROR: collation "utf8_ci_ai" for encoding "UTF8" does not exist` | Plain external Postgres lacks Appwrite's custom collation (the `appwrite/postgres` image ships it pre-created) | `CREATE COLLATION IF NOT EXISTS public.utf8_ci_ai (provider = icu, locale = 'und-u-ks-level1', deterministic = false);` — run inside the `appwrite` database |
+| Usage/executions schema never ready: `Port 9000 is for clickhouse-client program` | ClickHouse port mapping swapped — host 8123 forwards to the container's native port 9000 | Map `8123:8123`, verify `curl http://<host>:8123/ping` returns `Ok.`, restart the stack |
+| `appwrite-assistant` restart-loops: `OpenAI or Azure OpenAI API key not found` | Assistant enabled without `_APP_ASSISTANT_OPENAI_API_KEY` (upstream runs it always-on) | Add the key, or leave the `assistant` profile off — the default doesn't start it |
 
 ## Differences from the upstream 2.0.0 compose
 
@@ -193,12 +206,15 @@ Intentional adaptations, all verified against upstream:
 
 - Coolify's proxy replaces Appwrite's own Traefik (no ports exposed, no traefik service/network)
 - Coolify magic variables generate all credentials and routing; domains are managed in the Coolify UI
+- The docker-run setup wizard (hostname / database engine / topology prompts) is replaced by this file plus Coolify's UI: engine = Postgres (fixed), topology = `COMPOSE_PROFILES`, secrets = magic variables, domain = Coolify domains + `_APP_DOMAIN`
 - `restart: unless-stopped` normalized across all services; log rotation on all services (from upstream, applied everywhere)
 - Executor: no `container_name`, `hostname: openruntimes-executor` (Coolify renames containers; the executor finds itself by hostname)
 - Internal hostnames use compose service names (`openruntimes-executor`, not `exc1`) for the same reason
 - Worker topology behind profiles (combined default, separate opt-in); profile-parked services excluded from the stack status badge
 - API healthcheck extended with an Origin-allowlist assertion (custom addition)
 - `mariadb` service removed (PostgreSQL default for fresh installs)
+- Assistant behind the optional `assistant` profile (upstream runs it always-on; it exits with an error when no OpenAI key is set)
+- Includes `appwrite-autogravity` (image focal-point previews), added upstream on `main` after the 2.0.0 tag — consumed by platform images newer than 2.0.0 via `_APP_AUTOGRAVITY_HOST`; on 2.0.0 it runs idle with no side effects
 - MongoDB helper scripts inlined as compose `configs` (single-file template)
 
 ## Credits
