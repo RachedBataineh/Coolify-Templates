@@ -1,0 +1,26 @@
+# =============================================================================
+# Appwrite 2.0.0 + Redis AUTH fix for the queue publisher
+# =============================================================================
+# Fixes: task-scheduler "[StatsResources] Failed to publish stats resources
+# message: NOAUTH Authentication required" when Redis requires a password
+# (upstream bug — see README troubleshooting row and upstream-issue-draft.md).
+#
+# The patch is baked into the image, so it survives every redeploy. The fix
+# is inert when Redis has no password (getenv returns empty -> no auth call),
+# so the image is safe for any topology.
+#
+# Build and push (replace <registry-user> with your Docker Hub / GHCR user):
+#   docker build -f Dockerfile.appwrite-redisauth -t <registry-user>/appwrite:2.0.0-redisauth .
+#   docker login
+#   docker push <registry-user>/appwrite:2.0.0-redisauth
+#
+# Then in the Coolify stack's Environment tab:
+#   _APP_IMAGE=<registry-user>/appwrite
+#   _APP_VERSION=2.0.0-redisauth
+# and redeploy. When Appwrite ships the official fix, set both back to the
+# stock values and delete this file.
+# =============================================================================
+FROM appwrite/appwrite:2.0.0
+
+COPY docker-patch-redis-auth.php /tmp/patch-redis-auth.php
+RUN php /tmp/patch-redis-auth.php && rm /tmp/patch-redis-auth.php

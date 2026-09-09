@@ -147,9 +147,10 @@ Appwrite officially supports horizontal scaling: stateless functions/worker cont
 - **Patch upgrades** (2.0.0 → 2.0.1): bump `_APP_VERSION` in the Coolify UI and redeploy. Check the [release notes](https://github.com/appwrite/appwrite/releases) — a migration is only required if they say so.
 - **Minor/major upgrades** (2.0 → 2.1): after bumping and redeploying, run the migration once from the server terminal:
   ```bash
-  docker compose -f /data/coolify/services/<stack-uuid>/docker-compose.yml exec appwrite migrate
+  docker ps --format '{{.Names}}' | grep appwrite   # find the API container (the plain "appwrite" one — not realtime/worker)
+  docker exec -it <that-container> migrate
   ```
-  (Or: `docker exec -it <appwrite-container> migrate`.) Back up the database first, and step through each minor version rather than skipping (per the [official update guide](https://appwrite.io/docs/advanced/self-hosting/production/updates)).
+  Back up the database first, and step through each minor version rather than skipping (per the [official update guide](https://appwrite.io/docs/advanced/self-hosting/production/updates)).
 - **Fresh PostgreSQL installs only.** For existing Appwrite installations, follow the official Appwrite upgrade docs — do not reuse old volumes with this file. (MariaDB installs: swap the `postgresql` service for `mariadb` and set `_APP_DB_ADAPTER=mariadb`.)
 - Set `_APP_SMTP_*` before inviting users (emails queue until then):
   ```
@@ -199,6 +200,10 @@ Every entry below was hit and verified in a real deployment.
 | Boot fails: `ERROR: collation "utf8_ci_ai" for encoding "UTF8" does not exist` | Plain external Postgres lacks Appwrite's custom collation (the `appwrite/postgres` image ships it pre-created) | `CREATE COLLATION IF NOT EXISTS public.utf8_ci_ai (provider = icu, locale = 'und-u-ks-level1', deterministic = false);` — run inside the `appwrite` database |
 | Usage/executions schema never ready: `Port 9000 is for clickhouse-client program` | ClickHouse port mapping swapped — host 8123 forwards to the container's native port 9000 | Map `8123:8123`, verify `curl http://<host>:8123/ping` returns `Ok.`, restart the stack |
 | `appwrite-assistant` restart-loops: `OpenAI or Azure OpenAI API key not found` | Assistant enabled without `_APP_ASSISTANT_OPENAI_API_KEY` (upstream runs it always-on) | Add the key, or leave the `assistant` profile off — the default doesn't start it |
+| task-scheduler logs: `Failed to publish stats resources message: NOAUTH Authentication required` (external Redis with password) | Upstream bug, two layers: (1) Appwrite 2.0.0 `registers.php` builds the `publisher` pool as `Queue\Connection\Redis($host, $port)` — dropping the user/password present in the DSN; (2) `utopia-php/queue` 1.5.2's `Connection\Redis` accepts `$user`/`$password` constructor args but never calls `auth()`. The cache/pubsub/lock pools authenticate correctly, which is why realtime and everything else work. Invisible on the official compose because its bundled Redis is passwordless | **Fixed in this file**: the external-DBs template ships the patched connection class as an inline compose `config` (`queue-redis-auth`), overlaid into all five scheduler-family services — survives every redeploy, inert when Redis has no password. Verified live against passworded Redis Cloud: `projects_failed 1 → 0`. **Editing note**: every `$` in the config content is escaped as `$$` — compose interpolation eats bare PHP variables otherwise (`$awp` becomes empty → PHP `syntax error, unexpected token "="`); it renders into the container as a single `$`. Remove the block when an Appwrite release > 2.0.0 carries the fix. Alternatives: `patch-redis-auth.sh` (live), `Dockerfile.appwrite-redisauth` (image). Reference copy: `patches/queue-redis-auth.php`. See `upstream-issue-draft.md` |
+| Worker logs: `Cannot renew domain ... Failed to issue a certificate ... http-01 challenge ... Challenge failed` + `Skipped mail processing. No SMTP configuration` | Appwrite's certificate worker is trying Let's Encrypt HTTP-01 issuance — impossible behind Coolify's proxy, which owns ports 80/443 (upstream defaults this to enabled; TLS for your domain is Coolify's job) | Template now defaults `_APP_ROUTER_AUTO_CERTIFICATES=disabled`; on an existing stack set it in the env tab and redeploy. Harmless to serving — the follow-up "skipped mail" error is just the failure report having nowhere to go until SMTP is configured |
+| Postgres logs `ERROR: relation "logsV1__metadata" already exists` (and `_console__metadata`) on redeploy | Boot re-runs idempotent table creation against a persisted volume; Postgres logs the duplicate while Appwrite catches it and continues | Nothing — expected on every redeploy with existing data |
+| Postgres logs `WARNING: there is no transaction in progress` every few seconds | Benign noise from the usage-stats client's commit pattern | Nothing — safe to ignore (verify with Appwrite before assuming on other setups) |
 
 ## Differences from the upstream 2.0.0 compose
 
@@ -210,6 +215,7 @@ Intentional adaptations, all verified against upstream:
 - `restart: unless-stopped` normalized across all services; log rotation on all services (from upstream, applied everywhere)
 - Executor: no `container_name`, `hostname: openruntimes-executor` (Coolify renames containers; the executor finds itself by hostname)
 - Internal hostnames use compose service names (`openruntimes-executor`, not `exc1`) for the same reason
+- Network names pinned (`appwrite`, `runtimes`) so runtime containers and the jobs plane attach by stable names — consequence: one Appwrite stack per Docker host
 - Worker topology behind profiles (combined default, separate opt-in); profile-parked services excluded from the stack status badge
 - API healthcheck extended with an Origin-allowlist assertion (custom addition)
 - `mariadb` service removed (PostgreSQL default for fresh installs)

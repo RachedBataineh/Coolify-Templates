@@ -97,12 +97,16 @@ From node A's Coolify Environment tab, copy the **literal values** of every shar
 _APP_OPENSSL_KEY_V1          ← signs API/resource tokens; must be identical everywhere
 _APP_DB_USER                 ← external Postgres credentials
 _APP_DB_PASS
+_APP_REDIS_USER              ← external Redis credentials (if Redis has auth)
+_APP_REDIS_PASS
 _APP_EXECUTOR_SECRET
 _APP_JOBS_SECRET
 _APP_GEO_SECRET
 _APP_NOTIFICATIONS_TRACKING_SECRET
 _APP_USAGE_PASS              ← ClickHouse password
 ```
+
+> If you override the full ClickHouse DSNs (`_APP_CONNECTIONS_DB_USAGE` / `_APP_CONNECTIONS_DB_EXECUTIONS`), copy those literal values to every node too — otherwise the defaults rebuild them from `_APP_USAGE_PASS` and the hosts.
 
 Also note the exact values of:
 
@@ -131,7 +135,7 @@ This is the template default — verify it, don't assume it.
 
 ### 2.1 Deploy the identical compose file
 
-On node B's Coolify (or the same Coolify, different server destination): New Resource → Docker Compose → paste the **same** `docker-compose-appwrite-coolify-2.0.0.yaml`.
+On node B's Coolify (or the same Coolify, different server destination): New Resource → Docker Compose → paste the **same** `docker-compose-appwrite-include-dbs.yaml`.
 
 ### 2.2 Set the env differences
 
@@ -209,7 +213,7 @@ Full control, your maintenance burden. Required features: websocket pass-through
 - [ ] Register a session via one node, use it on another (logout/login across LB) — validates shared sessions
 - [ ] Create a table row via the API, read it via a direct request to node B — validates shared Postgres
 - [ ] Trigger a realtime event, subscribe through the LB — validates Redis pub/sub across nodes
-- [ ] Deploy a scheduled test function (runs every minute for a minute) — confirm it fires **exactly once** (validates timers-once)
+- [ ] Deploy a scheduled test function (every minute) — confirm it fires **exactly once per minute** (validates timers-once)
 - [ ] Deploy a site/function build — confirm it succeeds on whichever node's executor picks it up
 
 ---
