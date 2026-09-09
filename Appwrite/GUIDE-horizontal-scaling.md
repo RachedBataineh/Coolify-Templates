@@ -68,6 +68,7 @@ No sticky sessions are needed: sessions live in PostgreSQL and realtime events f
 - [ ] PostgreSQL, Redis, ClickHouse on their own servers, reachable from every future node over a **private network**
 - [ ] One-time SQL run on the external Postgres (see block below) — a plain server lacks both objects
 - [ ] ClickHouse HTTP interface verified: `curl http://<clickhouse-host>:8123/ping` returns `Ok.` — if it says *"Port 9000 is for clickhouse-client program"*, the port mapping is `8123:9000` and must be `8123:8123`
+- [ ] ClickHouse DSNs match your server: set `_APP_CLICKHOUSE_USER`/`_APP_CLICKHOUSE_DB` (required — e.g. `default`/`default` on a Coolify standalone ClickHouse). The DSNs build from these + `_APP_USAGE_PASS`; a mismatch fails *silently* — usage stats never initialize
 - [ ] Firewall rules: database ports (5432, 6379, 8123 — or your custom ports, e.g. 5411 for Postgres) accept connections **only** from app nodes' private IPs
 - [ ] Storage device is S3/R2 (not Local) — all nodes must read/write the same files
 - [ ] SMTP configured
