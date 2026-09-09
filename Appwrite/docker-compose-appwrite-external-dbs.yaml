@@ -47,7 +47,11 @@ x-logging:
     options:
       max-file: "5"
       max-size: 10m
-# Queue publisher Redis AUTH fix, reusable mount for scheduler-family services.
+# Queue publisher Redis AUTH fix, mounted on ALL appwrite-image services.
+# Both directions need it: schedulers PUBLISH through the publisher pool, and
+# the combined/separate workers' queue CONSUMERS borrow the same pool
+# (app/worker.php: BrokerPool(publisher, consumer: $publisher)). Without the
+# overlay on workers too, messages pile up in Redis unconsumed.
 # See README troubleshooting row "NOAUTH Authentication required".
 x-redis-auth-config: &redis-auth-config
   - source: queue-redis-auth
@@ -91,6 +95,7 @@ services:
     depends_on:
       - appwrite-geo
       - appwrite-autogravity
+    configs: *redis-auth-config
     environment:
       # The _80 suffix pins the Traefik backend port explicitly; without it
       # Coolify's port auto-detection can pick a wrong port and every /v1
@@ -341,6 +346,7 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    configs: *redis-auth-config
     environment:
       # Port-less on purpose: declaring the same port-suffixed variable on
       # two services with different paths makes Coolify merge their routers.
@@ -418,6 +424,7 @@ services:
       - appwrite-imports:/storage/imports:rw
     extra_hosts:
       - host.docker.internal:host-gateway
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_USAGE_STATS=${_APP_USAGE_STATS:-enabled}'
@@ -638,6 +645,7 @@ services:
         max-size: 10m
     networks:
       - appwrite
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
@@ -680,6 +688,7 @@ services:
         max-size: 10m
     networks:
       - appwrite
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_OPENSSL_KEY_V1=$SERVICE_PASSWORD_64_APPWRITE
@@ -761,6 +770,7 @@ services:
         max-size: 10m
     networks:
       - appwrite
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -807,6 +817,7 @@ services:
       - appwrite-sites:/storage/sites:rw
       - appwrite-builds:/storage/builds:rw
       - appwrite-certificates:/storage/certificates:rw
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-}'
@@ -890,6 +901,7 @@ services:
         max-size: 10m
     networks:
       - appwrite
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -951,6 +963,7 @@ services:
       - appwrite-builds:/storage/builds:rw
     extra_hosts:
       - host.docker.internal:host-gateway
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1056,6 +1069,7 @@ services:
       - appwrite-builds:/storage/builds:rw
     extra_hosts:
       - host.docker.internal:host-gateway
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1118,6 +1132,7 @@ services:
       - appwrite
     volumes:
       - appwrite-uploads:/storage/uploads:rw
+    configs: *redis-auth-config
     environment:
       - '_APP_BROWSER_HOST=${_APP_BROWSER_HOST:-http://appwrite-browser:3000/v1}'
       - '_APP_SITES_TIMEOUT=${_APP_SITES_TIMEOUT:-60}'
@@ -1185,6 +1200,7 @@ services:
     volumes:
       - appwrite-config:/storage/config:rw
       - appwrite-certificates:/storage/certificates:rw
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1230,6 +1246,7 @@ services:
         max-size: 10m
     networks:
       - appwrite
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_USAGE_PASS=${_APP_USAGE_PASS:-}'
@@ -1272,6 +1289,7 @@ services:
         max-size: 10m
     networks:
       - appwrite
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1320,6 +1338,7 @@ services:
         max-size: 10m
     networks:
       - appwrite
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1366,6 +1385,7 @@ services:
         max-size: 10m
     networks:
       - appwrite
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_WORKER_PER_CORE=${_APP_WORKER_PER_CORE:-6}'
@@ -1412,6 +1432,7 @@ services:
       - appwrite
     volumes:
       - appwrite-uploads:/storage/uploads:rw
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1476,6 +1497,7 @@ services:
     volumes:
       - appwrite-imports:/storage/imports:rw
       - appwrite-uploads:/storage/uploads:rw
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - _APP_WORKERS_NUM=1
@@ -1539,6 +1561,7 @@ services:
         max-size: 10m
     networks:
       - appwrite
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
@@ -1589,6 +1612,7 @@ services:
         max-size: 10m
     networks:
       - appwrite
+    configs: *redis-auth-config
     environment:
       - '_APP_ENV=${_APP_ENV:-production}'
       - '_APP_LOGGING_FORMAT=${_APP_LOGGING_FORMAT:-pretty}'
